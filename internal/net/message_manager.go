@@ -72,8 +72,13 @@ func (m *messageSenderImpl) OnDisconnect(ctx context.Context, p peer.ID) {
 			return
 		}
 		defer ms.lk.Unlock()
+		defer close(ms.closeSend)
+		//defer close(ms.chanmessage)
+		//defer close(ms.chanrequest)
+		//defer close(ms.explicitStop)
 		ms.closeSend <- struct{}{}
 		ms.invalidate()
+		ms = nil
 	}()
 }
 
@@ -100,10 +105,10 @@ type peerInitInfo struct {
 func (m *messageSenderImpl) SendRequest(ctx context.Context, p peer.ID, pmes *pb.Message) (*pb.Message, error) {
 	ctx, _ = tag.New(ctx, metrics.UpsertMessageType(pmes))
 	pschan := make(chan peerInitInfo)
-	ms := new(peerMessageSender)
 	go func(psc chan peerInitInfo) {
-		ms, err := m.messageSenderForPeer(ctx, p)
-		psc <- peerInitInfo{sender: ms, errs: err}
+		defer close(psc)
+		msender, err := m.messageSenderForPeer(ctx, p)
+		psc <- peerInitInfo{sender: msender, errs: err}
 	}(pschan)
 	t := time.NewTimer(dhtMessageSenderTimeout)
 	defer t.Stop()
@@ -117,7 +122,7 @@ func (m *messageSenderImpl) SendRequest(ctx context.Context, p peer.ID, pmes *pb
 			logger.Debugw("request failed to open message sender", "error", sinfo.errs, "to", p)
 			return nil, sinfo.errs
 		} else {
-			ms = sinfo.sender
+			ms := sinfo.sender
 			start := time.Now()
 
 			rpmes, err := ms.SendRequest(ctx, pmes)
@@ -149,12 +154,11 @@ func (m *messageSenderImpl) SendRequest(ctx context.Context, p peer.ID, pmes *pb
 // SendMessage sends out a message
 func (m *messageSenderImpl) SendMessage(ctx context.Context, p peer.ID, pmes *pb.Message) error {
 	ctx, _ = tag.New(ctx, metrics.UpsertMessageType(pmes))
-
 	pschan := make(chan peerInitInfo)
-	ms := new(peerMessageSender)
 	go func(psc chan peerInitInfo) {
-		ms, err := m.messageSenderForPeer(ctx, p)
-		psc <- peerInitInfo{sender: ms, errs: err}
+		defer close(psc)
+		msender, err := m.messageSenderForPeer(ctx, p)
+		psc <- peerInitInfo{sender: msender, errs: err}
 	}(pschan)
 	t := time.NewTimer(dhtMessageSenderTimeout)
 	defer t.Stop()
@@ -168,7 +172,7 @@ func (m *messageSenderImpl) SendMessage(ctx context.Context, p peer.ID, pmes *pb
 			logger.Debugw("request failed to open message sender", "error", sinfo.errs, "to", p)
 			return sinfo.errs
 		} else {
-			ms = sinfo.sender
+			ms := sinfo.sender
 			start := time.Now()
 
 			err := ms.SendMessage(ctx, pmes)
@@ -527,6 +531,7 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 				ms.chanrequest = nil
 				ms.chanmessage = nil
 				ms.closeSend = nil
+				ms.explicitStop = nil
 				return
 			case <-readNotif:
 				if l, _ := ms.r.NextMsgLen(); l > 0 {
@@ -627,6 +632,7 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 
 				} else {
 					go func(rcv chan MultiMessageResponse, errc error) {
+						defer close(rcv)
 						rcv <- MultiMessageResponse{message: nil, err: errc}
 					}(reqinfo.receiver, err)
 				}
@@ -638,24 +644,28 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 			if err, unresponsive := ms.IsUnresponsivePeer(); !unresponsive {
 				if err := ms.prep(minfo.ctx); err != nil {
 					go func(rcv chan MultiMessageResponse, errc error) {
+						defer close(rcv)
 						rcv <- MultiMessageResponse{message: nil, err: errc}
 					}(minfo.receiver, err)
 				} else if err := ms.writeMsg(minfo.message); err != nil {
 					_ = ms.s.Reset()
 					ms.s = nil
 					go func(rcv chan MultiMessageResponse, errc error) {
+						defer close(rcv)
 						rcv <- MultiMessageResponse{message: nil, err: errc}
 					}(minfo.receiver, err)
 					ms.UpdateUnresponsiveMap()
 					logger.Debugw("lookup patch", "infinite writer", "error while writing message", "to", ms.p.String(), "error", err)
 				} else {
 					go func(rcv chan MultiMessageResponse, errc error) {
+						defer close(rcv)
 						rcv <- MultiMessageResponse{message: nil, err: errc}
 					}(minfo.receiver, nil)
 				}
 
 			} else {
 				go func(rcv chan MultiMessageResponse, errc error) {
+					defer close(rcv)
 					rcv <- MultiMessageResponse{message: nil, err: errc}
 				}(minfo.receiver, err)
 			}
@@ -663,6 +673,7 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 		case <-ms.closeSend:
 			logger.Debugw("lookup patch", "infinite writer", "stopped", "for", ms.p.String())
 			go func() {
+				defer close(sendNotif)
 				sendNotif <- struct{}{}
 			}()
 			return

@@ -78,7 +78,7 @@ func (m *messageSenderImpl) OnDisconnect(ctx context.Context, p peer.ID) {
 		//defer close(ms.explicitStop)
 		ms.closeSend <- struct{}{}
 		ms.invalidate()
-		ms = nil
+		//ms = nil
 	}()
 }
 
@@ -520,6 +520,8 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 	logger.Debugw("lookup patch", "infinite writer", "started", "for", ms.p.String())
 	sendNotif := make(chan struct{})
 	readNotif := make(chan struct{})
+	stopWriterNotif := make(chan struct{})
+	isStopSignalSet := false
 	go func() {
 		logger.Debugw("lookup patch", "infinite reader", "started", "for", ms.p.String())
 
@@ -527,11 +529,11 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 			select {
 			case <-sendNotif:
 				logger.Debugw("lookup patch", "infinite reader", "stopped", "for", ms.p.String())
-				ms.chanMap = nil
+				/*ms.chanMap = nil
 				ms.chanrequest = nil
 				ms.chanmessage = nil
 				ms.closeSend = nil
-				ms.explicitStop = nil
+				ms.explicitStop = nil*/
 				return
 			case <-readNotif:
 				if l, _ := ms.r.NextMsgLen(); l > 0 {
@@ -671,11 +673,19 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 			}
 			ms.mu.Unlock()
 		case <-ms.closeSend:
+			if !isStopSignalSet {
+				logger.Debugw("lookup patch", "infinite writer", "stopping in 30s", "for", ms.p.String())
+
+				go func() {
+					defer close(sendNotif)
+					time.Sleep(30 * time.Second)
+					sendNotif <- struct{}{}
+					stopWriterNotif <- struct{}{}
+				}()
+				isStopSignalSet = true
+			}
+		case <-stopWriterNotif:
 			logger.Debugw("lookup patch", "infinite writer", "stopped", "for", ms.p.String())
-			go func() {
-				defer close(sendNotif)
-				sendNotif <- struct{}{}
-			}()
 			return
 
 		}

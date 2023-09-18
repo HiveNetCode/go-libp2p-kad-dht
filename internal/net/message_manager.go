@@ -66,20 +66,34 @@ func (m *messageSenderImpl) OnDisconnect(ctx context.Context, p peer.ID) {
 	}
 	delete(m.strmap, p)
 
+	//defer close(ms.chanmessage)
+	//defer close(ms.chanrequest)
+	//defer close(ms.explicitStop)
+
 	// Do this asynchronously as ms.lk can block for a while.
 	go func() {
 		if err := ms.lk.Lock(ctx); err != nil {
 			return
 		}
 		defer ms.lk.Unlock()
-		defer close(ms.closeSend)
-		//defer close(ms.chanmessage)
-		//defer close(ms.chanrequest)
-		//defer close(ms.explicitStop)
-		ms.closeSend <- struct{}{}
+		//defer close(ms.closeSend)
 		ms.invalidate()
+
 		//ms = nil
 	}()
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.running = false
+
+	if ms.closeSend != nil {
+		ms.closeSend <- struct{}{}
+		close(ms.closeSend)
+		ms.closeSend = nil
+	} else {
+		return
+	}
+
 }
 
 // @Hive: Forges early timeout if the remote peer has been flagged unresponsive for less than backoffTime
@@ -210,7 +224,8 @@ func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID)
 	}
 	ms = &peerMessageSender{p: p, m: m, lk: internal.NewCtxMutex(), isResponsive: true, addTime: time.Now(),
 		backoffTime: dhtDefaultBackoffTime, closeSend: make(chan struct{}), chanMap: make(map[string]chan MultiMessageResponse),
-		chanrequest: make(chan MessageInfo), chanmessage: make(chan MessageInfo), explicitStop: make(chan struct{})}
+		chanrequest: make(chan MessageInfo), chanmessage: make(chan MessageInfo),
+		explicitStop: make(chan struct{}), running: true}
 
 	m.strmap[p] = ms
 	m.smlk.Unlock()
@@ -261,6 +276,7 @@ type peerMessageSender struct {
 	messageId    int
 	chanrequest  chan MessageInfo
 	chanmessage  chan MessageInfo
+	running      bool
 }
 
 // invalidate is called before this peerMessageSender is removed from the strmap.
@@ -317,13 +333,17 @@ const streamReuseTries = 3 //instead of 3
 func (ms *peerMessageSender) SendMessage(ctx context.Context, pmes *pb.Message) error {
 
 	ms.mu.Lock()
+	if !ms.running {
+		ms.mu.Unlock()
+		return fmt.Errorf("infinite writer is not running")
+	}
 	if err, unresponsive := ms.IsUnresponsivePeer(); unresponsive {
 
 		logger.Debugw("lookup patch", "error", err, "to", ms.p, "message type", pmes.GetType().String())
 		ms.mu.Unlock()
 		return err
 	}
-	ms.mu.Unlock()
+	//ms.mu.Unlock()
 	rcv := make(chan MultiMessageResponse)
 	messageWithInfo := MessageInfo{
 		message:  pmes,
@@ -331,7 +351,16 @@ func (ms *peerMessageSender) SendMessage(ctx context.Context, pmes *pb.Message) 
 		receiver: rcv,
 		ctx:      ctx,
 	}
-	ms.chanmessage <- messageWithInfo
+	if ms.running {
+		//ms.mu.Unlock()
+		ms.chanmessage <- messageWithInfo
+	} else {
+		ms.mu.Unlock()
+		close(rcv)
+		//ms.mu.Unlock()
+		return fmt.Errorf("infinite request channel has been closed")
+	}
+	ms.mu.Unlock()
 	select {
 	case ret := <-rcv:
 		if ret.err != nil {
@@ -373,12 +402,18 @@ func (ms *peerMessageSender) SendEarlyErrorToAll(err error) {
 
 func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) (*pb.Message, error) {
 	ms.mu.Lock()
+	if !ms.running {
+		ms.mu.Unlock()
+		return nil, fmt.Errorf("message sender has been invalidated")
+	}
 	if err, unresponsive := ms.IsUnresponsivePeer(); unresponsive {
 		logger.Debugw("lookup patch", "error", err, "to", ms.p, "request type", pmes.GetType().String())
 		ms.mu.Unlock()
 		return nil, err
 	}
-	ms.mu.Unlock()
+	ms.SetRequestId(pmes)
+	msid := GenerateRequestId(pmes)
+	//ms.mu.Unlock()
 	rcv := make(chan MultiMessageResponse)
 	messageWithInfo := MessageInfo{
 		message:  pmes,
@@ -386,9 +421,17 @@ func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) 
 		receiver: rcv,
 		ctx:      ctx,
 	}
-	go func() {
-		ms.chanrequest <- messageWithInfo //:
-	}()
+	if ms.running {
+		go func() {
+			ms.chanrequest <- messageWithInfo
+		}()
+	} else {
+		ms.mu.Unlock()
+		close(rcv)
+		return nil, fmt.Errorf("infinite request channel has been closed")
+	}
+	ms.mu.Unlock()
+
 	t := time.NewTimer(dhtReadMessageTimeout)
 	defer t.Stop()
 	select {
@@ -401,10 +444,16 @@ func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) 
 		return ret.message, ret.err
 
 	case <-t.C:
+		//ms.mu.Lock()
 		go func() {
-			ms.explicitStop <- struct{}{}
+			if ms.running {
+				ms.explicitStop <- struct{}{}
+			}
 
 		}()
+		ms.mu2.Lock()
+		delete(ms.chanMap, msid)
+		ms.mu2.Unlock()
 		ms.mu.Lock()
 		ms.UpdateUnresponsiveMap()
 		ms.mu.Unlock()
@@ -529,11 +578,8 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 			select {
 			case <-sendNotif:
 				logger.Debugw("lookup patch", "infinite reader", "stopped", "for", ms.p.String())
-				/*ms.chanMap = nil
-				ms.chanrequest = nil
-				ms.chanmessage = nil
-				ms.closeSend = nil
-				ms.explicitStop = nil*/
+				stopWriterNotif <- struct{}{}
+				close(stopWriterNotif)
 				return
 			case <-readNotif:
 				if l, _ := ms.r.NextMsgLen(); l > 0 {
@@ -599,7 +645,7 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 			default:
 				ms.mu.Lock()
 				if err, unresponsive := ms.IsUnresponsivePeer(); !unresponsive {
-					ms.SetRequestId(reqinfo.message)
+					//ms.SetRequestId(reqinfo.message)
 					msid := GenerateRequestId(reqinfo.message)
 					ms.mu2.Lock()
 					ms.chanMap[msid] = reqinfo.receiver
@@ -673,18 +719,38 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 			}
 			ms.mu.Unlock()
 		case <-ms.closeSend:
+			//ms.mu.Lock()
 			if !isStopSignalSet {
 				logger.Debugw("lookup patch", "infinite writer", "stopping in 30s", "for", ms.p.String())
 
 				go func() {
-					defer close(sendNotif)
+					//defer close(sendNotif)
+					//defer close(stopWriterNotif)
+					//defer close(readNotif)
 					time.Sleep(30 * time.Second)
 					sendNotif <- struct{}{}
-					stopWriterNotif <- struct{}{}
+					close(sendNotif)
+					//ms.mu2.Unlock()
+					//ms.mu.Unlock()
+
 				}()
 				isStopSignalSet = true
 			}
+			//ms.mu.Unlock()
 		case <-stopWriterNotif:
+			logger.Debugw("lookup patch", "infinite writer", "closing all channels", "for", ms.p.String())
+			ms.mu2.Lock()
+			for msid, _ := range ms.chanMap {
+				delete(ms.chanMap, msid)
+			}
+			ms.mu2.Unlock()
+
+			//ms.mu.Lock()
+			close(ms.chanrequest)
+			close(ms.chanmessage)
+			//close(ms.explicitStop)
+			//ms.explicitStop = nil
+			//ms.mu.Unlock()
 			logger.Debugw("lookup patch", "infinite writer", "stopped", "for", ms.p.String())
 			return
 

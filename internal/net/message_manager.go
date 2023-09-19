@@ -28,9 +28,10 @@ import (
 	pb "github.com/libp2p/go-libp2p-kad-dht/pb"
 )
 
-var dhtReadMessageTimeout = 5 * time.Second   //@Hive: Setting the timeout to 5s
-var dhtMessageSenderTimeout = 1 * time.Second //@Hive: Adding timeout when creating Sender
-var dhtDefaultBackoffTime = 300 * time.Second //@Hive: 5mn Backoff time for unresponsive peers
+var dhtReadMessageTimeout = 5 * time.Second        //@Hive: Setting the timeout to 5s
+var dhtMessageSenderTimeout = 1 * time.Second      //@Hive: Adding timeout when creating Sender
+var dhtDefaultBackoffTime = 60 * time.Second       //@Hive: 1mn Backoff time for unresponsive peers
+var SmallReadWriteInterval = 10 * time.Millisecond // 25 writes per second
 
 // ErrReadTimeout is an error that occurs when no message is read within the timeout period.
 var ErrReadTimeout = fmt.Errorf("timed out reading response")
@@ -65,10 +66,6 @@ func (m *messageSenderImpl) OnDisconnect(ctx context.Context, p peer.ID) {
 		return
 	}
 	delete(m.strmap, p)
-
-	//defer close(ms.chanmessage)
-	//defer close(ms.chanrequest)
-	//defer close(ms.explicitStop)
 
 	// Do this asynchronously as ms.lk can block for a while.
 	go func() {
@@ -118,49 +115,38 @@ type peerInitInfo struct {
 // measure the RTT for latency measurements.
 func (m *messageSenderImpl) SendRequest(ctx context.Context, p peer.ID, pmes *pb.Message) (*pb.Message, error) {
 	ctx, _ = tag.New(ctx, metrics.UpsertMessageType(pmes))
-	pschan := make(chan peerInitInfo)
-	go func(psc chan peerInitInfo) {
-		defer close(psc)
-		msender, err := m.messageSenderForPeer(ctx, p)
-		psc <- peerInitInfo{sender: msender, errs: err}
-	}(pschan)
-	t := time.NewTimer(dhtMessageSenderTimeout)
-	defer t.Stop()
-	select {
-	case sinfo := <-pschan:
-		if sinfo.errs != nil {
+	ctxfast, cancelfast := context.WithTimeout(ctx, dhtMessageSenderTimeout)
+	defer cancelfast()
+	msender, err := m.messageSenderForPeer(ctxfast, p)
+	if err != nil {
+		stats.Record(ctx,
+			metrics.SentRequests.M(1),
+			metrics.SentRequestErrors.M(1),
+		)
+		logger.Debugw("request failed to open message sender", "error", err, "to", p)
+		return nil, fmt.Errorf("timed out openning message sender to: %s", p.String())
+	} else {
+		ms := msender
+		start := time.Now()
+
+		rpmes, err := ms.SendRequest(ctx, pmes)
+		if err != nil {
 			stats.Record(ctx,
 				metrics.SentRequests.M(1),
 				metrics.SentRequestErrors.M(1),
 			)
-			logger.Debugw("request failed to open message sender", "error", sinfo.errs, "to", p)
-			return nil, sinfo.errs
-		} else {
-			ms := sinfo.sender
-			start := time.Now()
+			logger.Debugw("request failed", "error", err, "to", p)
 
-			rpmes, err := ms.SendRequest(ctx, pmes)
-			if err != nil {
-				stats.Record(ctx,
-					metrics.SentRequests.M(1),
-					metrics.SentRequestErrors.M(1),
-				)
-				logger.Debugw("request failed", "error", err, "to", p)
-
-				return nil, err
-			}
-
-			stats.Record(ctx,
-				metrics.SentRequests.M(1),
-				metrics.SentBytes.M(int64(pmes.Size())),
-				metrics.OutboundRequestLatency.M(float64(time.Since(start))/float64(time.Millisecond)),
-			)
-			m.host.Peerstore().RecordLatency(p, time.Since(start))
-			return rpmes, nil
+			return nil, err
 		}
-	case <-t.C:
-		return nil, fmt.Errorf("timed out openning message sender to: %s", p.String())
 
+		stats.Record(ctx,
+			metrics.SentRequests.M(1),
+			metrics.SentBytes.M(int64(pmes.Size())),
+			metrics.OutboundRequestLatency.M(float64(time.Since(start))/float64(time.Millisecond)),
+		)
+		m.host.Peerstore().RecordLatency(p, time.Since(start))
+		return rpmes, nil
 	}
 
 }
@@ -168,49 +154,37 @@ func (m *messageSenderImpl) SendRequest(ctx context.Context, p peer.ID, pmes *pb
 // SendMessage sends out a message
 func (m *messageSenderImpl) SendMessage(ctx context.Context, p peer.ID, pmes *pb.Message) error {
 	ctx, _ = tag.New(ctx, metrics.UpsertMessageType(pmes))
-	pschan := make(chan peerInitInfo)
-	go func(psc chan peerInitInfo) {
-		defer close(psc)
-		msender, err := m.messageSenderForPeer(ctx, p)
-		psc <- peerInitInfo{sender: msender, errs: err}
-	}(pschan)
-	t := time.NewTimer(dhtMessageSenderTimeout)
-	defer t.Stop()
-	select {
-	case sinfo := <-pschan:
-		if sinfo.errs != nil {
+	ctxfast, cancelfast := context.WithTimeout(ctx, dhtMessageSenderTimeout)
+	defer cancelfast()
+	msender, err := m.messageSenderForPeer(ctxfast, p)
+	if err != nil {
+		stats.Record(ctx,
+			metrics.SentRequests.M(1),
+			metrics.SentRequestErrors.M(1),
+		)
+		logger.Debugw("request failed to open message sender", "error", err, "to", p)
+		return fmt.Errorf("timed out openning message sender to: %s", p.String())
+	} else {
+		ms := msender
+		start := time.Now()
+		err := ms.SendMessage(ctx, pmes)
+		if err != nil {
 			stats.Record(ctx,
 				metrics.SentRequests.M(1),
 				metrics.SentRequestErrors.M(1),
 			)
-			logger.Debugw("request failed to open message sender", "error", sinfo.errs, "to", p)
-			return sinfo.errs
-		} else {
-			ms := sinfo.sender
-			start := time.Now()
+			logger.Debugw("request failed", "error", err, "to", p)
 
-			err := ms.SendMessage(ctx, pmes)
-			if err != nil {
-				stats.Record(ctx,
-					metrics.SentRequests.M(1),
-					metrics.SentRequestErrors.M(1),
-				)
-				logger.Debugw("request failed", "error", err, "to", p)
-
-				return err
-			}
-
-			stats.Record(ctx,
-				metrics.SentRequests.M(1),
-				metrics.SentBytes.M(int64(pmes.Size())),
-				metrics.OutboundRequestLatency.M(float64(time.Since(start))/float64(time.Millisecond)),
-			)
-			m.host.Peerstore().RecordLatency(p, time.Since(start))
-			return nil
+			return err
 		}
-	case <-t.C:
-		return fmt.Errorf("timed out openning message sender to: %s", p.String())
 
+		stats.Record(ctx,
+			metrics.SentRequests.M(1),
+			metrics.SentBytes.M(int64(pmes.Size())),
+			metrics.OutboundRequestLatency.M(float64(time.Since(start))/float64(time.Millisecond)),
+		)
+		m.host.Peerstore().RecordLatency(p, time.Since(start))
+		return nil
 	}
 
 }
@@ -225,7 +199,7 @@ func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID)
 	ms = &peerMessageSender{p: p, m: m, lk: internal.NewCtxMutex(), isResponsive: true, addTime: time.Now(),
 		backoffTime: dhtDefaultBackoffTime, closeSend: make(chan struct{}), chanMap: make(map[string]chan MultiMessageResponse),
 		chanrequest: make(chan MessageInfo), chanmessage: make(chan MessageInfo),
-		explicitStop: make(chan struct{}), running: true}
+		explicitStop: make(chan struct{}), running: false}
 
 	m.strmap[p] = ms
 	m.smlk.Unlock()
@@ -238,11 +212,24 @@ func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID)
 			// Changed. Use the new one, old one is invalid and
 			// not in the map so we can just throw it away.
 			if ms != msCur {
+				msCur.mu.Lock()
+				if !msCur.running {
+					ctx2 := context.Background()
+					go msCur.InfiniteReader(ctx2)
+					msCur.running = true
+				}
+				msCur.mu.Unlock()
 				return msCur, nil
 			}
 			// Not changed, remove the now invalid stream from the
 			// map.
 			delete(m.strmap, p)
+			ms.mu.Lock()
+			if ms.running {
+				ms.closeSend <- struct{}{}
+				ms.running = false
+			}
+			ms.mu.Unlock()
 		}
 		// Invalid but not in map. Must have been removed by a disconnect.
 		return nil, err
@@ -250,7 +237,11 @@ func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID)
 	// All ready to go.
 	// Launching the Infinite reader
 	ctx2 := context.Background()
-	go ms.InfiniteReader(ctx2)
+	if !ms.running {
+		go ms.InfiniteReader(ctx2)
+		ms.running = true
+	}
+
 	return ms, nil
 }
 
@@ -351,9 +342,18 @@ func (ms *peerMessageSender) SendMessage(ctx context.Context, pmes *pb.Message) 
 		receiver: rcv,
 		ctx:      ctx,
 	}
+
 	if ms.running {
 		//ms.mu.Unlock()
-		ms.chanmessage <- messageWithInfo
+		go func() {
+			stopsend := time.NewTimer(2 * time.Second)
+			select {
+			case <-stopsend.C:
+				return
+			default:
+				ms.chanmessage <- messageWithInfo
+			}
+		}()
 	} else {
 		ms.mu.Unlock()
 		close(rcv)
@@ -361,6 +361,8 @@ func (ms *peerMessageSender) SendMessage(ctx context.Context, pmes *pb.Message) 
 		return fmt.Errorf("infinite request channel has been closed")
 	}
 	ms.mu.Unlock()
+	t := time.NewTimer(dhtReadMessageTimeout)
+	defer t.Stop()
 	select {
 	case ret := <-rcv:
 		if ret.err != nil {
@@ -369,6 +371,8 @@ func (ms *peerMessageSender) SendMessage(ctx context.Context, pmes *pb.Message) 
 			ms.mu.Unlock()
 		}
 		return ret.err
+	case <-t.C:
+		return ErrReadTimeout
 	}
 
 }
@@ -423,7 +427,13 @@ func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) 
 	}
 	if ms.running {
 		go func() {
-			ms.chanrequest <- messageWithInfo
+			stopsend := time.NewTimer(2 * time.Second)
+			select {
+			case <-stopsend.C:
+				return
+			default:
+				ms.chanrequest <- messageWithInfo
+			}
 		}()
 	} else {
 		ms.mu.Unlock()
@@ -444,17 +454,13 @@ func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) 
 		return ret.message, ret.err
 
 	case <-t.C:
-		//ms.mu.Lock()
-		go func() {
-			if ms.running {
-				ms.explicitStop <- struct{}{}
-			}
-
-		}()
-		ms.mu2.Lock()
-		delete(ms.chanMap, msid)
-		ms.mu2.Unlock()
 		ms.mu.Lock()
+		ms.mu2.Lock()
+		if ch, ok := ms.chanMap[msid]; ok {
+			close(ch)
+			delete(ms.chanMap, msid)
+		}
+		ms.mu2.Unlock()
 		ms.UpdateUnresponsiveMap()
 		ms.mu.Unlock()
 		return nil, ErrReadTimeout
@@ -582,7 +588,9 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 				close(stopWriterNotif)
 				return
 			case <-readNotif:
+				//time.Sleep(SmallReadTimer)
 				if l, _ := ms.r.NextMsgLen(); l > 0 {
+					time.Sleep(SmallReadWriteInterval) // time space between reads (pacing)
 					bytes, err := ms.r.ReadMsg()
 					if err != nil {
 						ms.r.ReleaseMsg(bytes)
@@ -597,21 +605,25 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 					}
 					msid := GenerateRequestId(mes)
 					ms.RestoreRequestInfo(mes)
-					msgchan := make(chan MultiMessageResponse)
-					ok := false
+					//msgchan := make(chan MultiMessageResponse)
+					//ok := false
 					ms.mu2.Lock()
-
-					if msgchan, ok = ms.chanMap[msid]; ok {
-						delete(ms.chanMap, msid)
-					}
-					ms.mu2.Unlock()
-					if ok {
+					if msgchan, ok := ms.chanMap[msid]; ok {
 						go func(rchan chan MultiMessageResponse, msg *pb.Message) {
 							defer close(rchan)
-							rchan <- MultiMessageResponse{message: msg, err: nil}
+							stopsend := time.NewTimer(2 * time.Second)
+							select {
+							case <-stopsend.C:
+								return
+							default:
+								rchan <- MultiMessageResponse{message: msg, err: nil}
+							}
 						}(msgchan, mes)
-
+						delete(ms.chanMap, msid)
+					} else {
+						mes = nil
 					}
+					ms.mu2.Unlock()
 					ms.r.ReleaseMsg(bytes)
 
 				}
@@ -623,69 +635,75 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 	for {
 		select {
 		case reqinfo := <-ms.chanrequest:
-			select {
-			case <-ms.explicitStop:
-				ms.mu.Lock()
-				go func(rcv chan MultiMessageResponse, errc error) {
-					defer close(rcv)
-					rcv <- MultiMessageResponse{message: nil, err: errc}
-				}(reqinfo.receiver, ErrEearlyReadTimeout)
-				for msid, rch := range ms.chanMap {
+			ms.mu.Lock()
+			if err, unresponsive := ms.IsUnresponsivePeer(); !unresponsive {
+				//ms.SetRequestId(reqinfo.message)
+				msid := GenerateRequestId(reqinfo.message)
+				ms.mu2.Lock()
+				ms.chanMap[msid] = reqinfo.receiver
+				ms.mu2.Unlock()
+				if err := ms.prep(reqinfo.ctx); err != nil {
 					go func(rcv chan MultiMessageResponse, errc error) {
 						defer close(rcv)
-						rcv <- MultiMessageResponse{message: nil, err: errc}
-					}(rch, ErrEearlyReadTimeout)
+						stopsend := time.NewTimer(2 * time.Second)
+						select {
+						case <-stopsend.C:
+							return
+						default:
+							rcv <- MultiMessageResponse{message: nil, err: errc}
+						}
+
+					}(reqinfo.receiver, err)
 					ms.mu2.Lock()
 					delete(ms.chanMap, msid)
 					ms.mu2.Unlock()
-				}
-				ms.UpdateUnresponsiveMap()
-				ms.mu.Unlock()
-
-			default:
-				ms.mu.Lock()
-				if err, unresponsive := ms.IsUnresponsivePeer(); !unresponsive {
-					//ms.SetRequestId(reqinfo.message)
-					msid := GenerateRequestId(reqinfo.message)
-					ms.mu2.Lock()
-					ms.chanMap[msid] = reqinfo.receiver
-					ms.mu2.Unlock()
-					if err := ms.prep(ctx); err != nil {
-						go func(rcv chan MultiMessageResponse, errc error) {
-							defer close(rcv)
-							rcv <- MultiMessageResponse{message: nil, err: errc}
-						}(reqinfo.receiver, err)
-						ms.mu2.Lock()
-						delete(ms.chanMap, msid)
-						ms.mu2.Unlock()
-					} else if err := ms.writeMsg(reqinfo.message); err != nil {
-						_ = ms.s.Reset()
-						ms.s = nil
-						go func(rcv chan MultiMessageResponse, errc error) {
-							defer close(rcv)
-							rcv <- MultiMessageResponse{message: nil, err: errc}
-						}(reqinfo.receiver, err)
-						ms.UpdateUnresponsiveMap()
-						logger.Debugw("lookup patch", "infinite writer", "error while writing request", "to", ms.p.String(), "error", err)
-						ms.mu2.Lock()
-						delete(ms.chanMap, msid)
-						ms.mu2.Unlock()
-					} else {
-						go func() {
-							readNotif <- struct{}{}
-
-						}()
-						// nothing for now
-					}
-
-				} else {
+				} else if err := ms.writeMsg(reqinfo.message); err != nil {
+					_ = ms.s.Reset()
+					ms.s = nil
 					go func(rcv chan MultiMessageResponse, errc error) {
 						defer close(rcv)
-						rcv <- MultiMessageResponse{message: nil, err: errc}
+						stopsend := time.NewTimer(2 * time.Second)
+						select {
+						case <-stopsend.C:
+							return
+						default:
+							rcv <- MultiMessageResponse{message: nil, err: errc}
+						}
 					}(reqinfo.receiver, err)
+					ms.UpdateUnresponsiveMap()
+					logger.Debugw("lookup patch", "infinite writer", "error while writing request", "to", ms.p.String(), "error", err)
+					ms.mu2.Lock()
+					delete(ms.chanMap, msid)
+					ms.mu2.Unlock()
+				} else {
+					time.Sleep(SmallReadWriteInterval) // time space between writes (pacing)
+					go func() {
+						stopsend := time.NewTimer(2 * time.Second)
+						select {
+						case <-stopsend.C:
+							return
+						default:
+							readNotif <- struct{}{}
+						}
+
+					}()
+					// nothing for now
 				}
-				ms.mu.Unlock()
+
+			} else {
+				go func(rcv chan MultiMessageResponse, errc error) {
+					defer close(rcv)
+					stopsend := time.NewTimer(2 * time.Second)
+					select {
+					case <-stopsend.C:
+						return
+					default:
+						rcv <- MultiMessageResponse{message: nil, err: errc}
+					}
+				}(reqinfo.receiver, err)
 			}
+			ms.mu.Unlock()
+			//}
 
 		case minfo := <-ms.chanmessage:
 			ms.mu.Lock()
@@ -693,28 +711,52 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 				if err := ms.prep(minfo.ctx); err != nil {
 					go func(rcv chan MultiMessageResponse, errc error) {
 						defer close(rcv)
-						rcv <- MultiMessageResponse{message: nil, err: errc}
+						stopsend := time.NewTimer(2 * time.Second)
+						select {
+						case <-stopsend.C:
+							return
+						default:
+							rcv <- MultiMessageResponse{message: nil, err: errc}
+						}
 					}(minfo.receiver, err)
 				} else if err := ms.writeMsg(minfo.message); err != nil {
 					_ = ms.s.Reset()
 					ms.s = nil
 					go func(rcv chan MultiMessageResponse, errc error) {
 						defer close(rcv)
-						rcv <- MultiMessageResponse{message: nil, err: errc}
+						stopsend := time.NewTimer(2 * time.Second)
+						select {
+						case <-stopsend.C:
+							return
+						default:
+							rcv <- MultiMessageResponse{message: nil, err: errc}
+						}
 					}(minfo.receiver, err)
 					ms.UpdateUnresponsiveMap()
 					logger.Debugw("lookup patch", "infinite writer", "error while writing message", "to", ms.p.String(), "error", err)
 				} else {
 					go func(rcv chan MultiMessageResponse, errc error) {
 						defer close(rcv)
-						rcv <- MultiMessageResponse{message: nil, err: errc}
+						stopsend := time.NewTimer(2 * time.Second)
+						select {
+						case <-stopsend.C:
+							return
+						default:
+							rcv <- MultiMessageResponse{message: nil, err: errc}
+						}
 					}(minfo.receiver, nil)
 				}
 
 			} else {
 				go func(rcv chan MultiMessageResponse, errc error) {
 					defer close(rcv)
-					rcv <- MultiMessageResponse{message: nil, err: errc}
+					stopsend := time.NewTimer(2 * time.Second)
+					select {
+					case <-stopsend.C:
+						return
+					default:
+						rcv <- MultiMessageResponse{message: nil, err: errc}
+					}
 				}(minfo.receiver, err)
 			}
 			ms.mu.Unlock()
@@ -724,14 +766,9 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 				logger.Debugw("lookup patch", "infinite writer", "stopping in 30s", "for", ms.p.String())
 
 				go func() {
-					//defer close(sendNotif)
-					//defer close(stopWriterNotif)
-					//defer close(readNotif)
 					time.Sleep(30 * time.Second)
 					sendNotif <- struct{}{}
 					close(sendNotif)
-					//ms.mu2.Unlock()
-					//ms.mu.Unlock()
 
 				}()
 				isStopSignalSet = true
@@ -739,18 +776,27 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 			//ms.mu.Unlock()
 		case <-stopWriterNotif:
 			logger.Debugw("lookup patch", "infinite writer", "closing all channels", "for", ms.p.String())
+			ms.mu.Lock()
 			ms.mu2.Lock()
-			for msid, _ := range ms.chanMap {
+			for msid, chanreq := range ms.chanMap {
+				go func(rcv chan MultiMessageResponse, errc error) {
+					defer close(rcv)
+					stopsend := time.NewTimer(2 * time.Second)
+					select {
+					case <-stopsend.C:
+						return
+					default:
+						rcv <- MultiMessageResponse{message: nil, err: errc}
+					}
+				}(chanreq, fmt.Errorf("infinite writer is closed"))
+
 				delete(ms.chanMap, msid)
 			}
 			ms.mu2.Unlock()
+			ms.mu.Unlock()
 
-			//ms.mu.Lock()
 			close(ms.chanrequest)
 			close(ms.chanmessage)
-			//close(ms.explicitStop)
-			//ms.explicitStop = nil
-			//ms.mu.Unlock()
 			logger.Debugw("lookup patch", "infinite writer", "stopped", "for", ms.p.String())
 			return
 

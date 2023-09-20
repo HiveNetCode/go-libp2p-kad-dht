@@ -75,8 +75,8 @@ func (m *messageSenderImpl) OnDisconnect(ctx context.Context, p peer.ID) {
 			return
 		}
 		ms.mu.Lock()
-		ms.mu.Unlock()
 		defer ms.lk.Unlock()
+		defer ms.mu.Unlock()
 		//defer close(ms.closeSend)
 		ms.invalidate()
 

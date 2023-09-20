@@ -67,29 +67,37 @@ func (m *messageSenderImpl) OnDisconnect(ctx context.Context, p peer.ID) {
 	}
 	delete(m.strmap, p)
 
+	//defer ms.mu.Unlock()
+
 	// Do this asynchronously as ms.lk can block for a while.
 	go func() {
 		if err := ms.lk.Lock(ctx); err != nil {
 			return
 		}
+		ms.mu.Lock()
+		ms.mu.Unlock()
 		defer ms.lk.Unlock()
 		//defer close(ms.closeSend)
 		ms.invalidate()
 
 		//ms = nil
 	}()
-
 	ms.mu.Lock()
-	defer ms.mu.Unlock()
-	ms.running = false
+	if ms.running == true {
+		ms.running = false
+		go func() {
+			//defer
+			stopsend := time.NewTimer(2 * time.Second)
+			select {
+			case <-stopsend.C:
+				return
+			default:
+				ms.closeSend <- struct{}{}
+			}
+		}()
 
-	if ms.closeSend != nil {
-		ms.closeSend <- struct{}{}
-		close(ms.closeSend)
-		ms.closeSend = nil
-	} else {
-		return
 	}
+	ms.mu.Unlock()
 
 }
 
@@ -159,19 +167,18 @@ func (m *messageSenderImpl) SendMessage(ctx context.Context, p peer.ID, pmes *pb
 	msender, err := m.messageSenderForPeer(ctxfast, p)
 	if err != nil {
 		stats.Record(ctx,
-			metrics.SentRequests.M(1),
-			metrics.SentRequestErrors.M(1),
+			metrics.SentMessages.M(1),
+			metrics.SentMessageErrors.M(1),
 		)
 		logger.Debugw("request failed to open message sender", "error", err, "to", p)
 		return fmt.Errorf("timed out openning message sender to: %s", p.String())
 	} else {
 		ms := msender
-		start := time.Now()
 		err := ms.SendMessage(ctx, pmes)
 		if err != nil {
 			stats.Record(ctx,
-				metrics.SentRequests.M(1),
-				metrics.SentRequestErrors.M(1),
+				metrics.SentMessages.M(1),
+				metrics.SentMessageErrors.M(1),
 			)
 			logger.Debugw("request failed", "error", err, "to", p)
 
@@ -179,11 +186,9 @@ func (m *messageSenderImpl) SendMessage(ctx context.Context, p peer.ID, pmes *pb
 		}
 
 		stats.Record(ctx,
-			metrics.SentRequests.M(1),
+			metrics.SentMessages.M(1),
 			metrics.SentBytes.M(int64(pmes.Size())),
-			metrics.OutboundRequestLatency.M(float64(time.Since(start))/float64(time.Millisecond)),
 		)
-		m.host.Peerstore().RecordLatency(p, time.Since(start))
 		return nil
 	}
 
@@ -198,10 +203,9 @@ func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID)
 	}
 	ms = &peerMessageSender{p: p, m: m, lk: internal.NewCtxMutex(), isResponsive: true, addTime: time.Now(),
 		backoffTime: dhtDefaultBackoffTime, closeSend: make(chan struct{}), chanMap: make(map[string]chan MultiMessageResponse),
-		chanrequest: make(chan MessageInfo), chanmessage: make(chan MessageInfo),
-		explicitStop: make(chan struct{}), running: false}
-
+		chanrequest: make(chan MessageInfo), chanmessage: make(chan MessageInfo), running: false}
 	m.strmap[p] = ms
+
 	m.smlk.Unlock()
 
 	if err := ms.prepOrInvalidate(ctx); err != nil {
@@ -212,24 +216,13 @@ func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID)
 			// Changed. Use the new one, old one is invalid and
 			// not in the map so we can just throw it away.
 			if ms != msCur {
-				msCur.mu.Lock()
-				if !msCur.running {
-					ctx2 := context.Background()
-					go msCur.InfiniteReader(ctx2)
-					msCur.running = true
-				}
-				msCur.mu.Unlock()
+				ms.mu.Lock()
 				return msCur, nil
 			}
 			// Not changed, remove the now invalid stream from the
 			// map.
 			delete(m.strmap, p)
-			ms.mu.Lock()
-			if ms.running {
-				ms.closeSend <- struct{}{}
-				ms.running = false
-			}
-			ms.mu.Unlock()
+
 		}
 		// Invalid but not in map. Must have been removed by a disconnect.
 		return nil, err
@@ -408,7 +401,7 @@ func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) 
 	ms.mu.Lock()
 	if !ms.running {
 		ms.mu.Unlock()
-		return nil, fmt.Errorf("message sender has been invalidated")
+		return nil, fmt.Errorf("infinite writer is not running")
 	}
 	if err, unresponsive := ms.IsUnresponsivePeer(); unresponsive {
 		logger.Debugw("lookup patch", "error", err, "to", ms.p, "request type", pmes.GetType().String())
@@ -429,6 +422,8 @@ func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) 
 		go func() {
 			stopsend := time.NewTimer(2 * time.Second)
 			select {
+			//case <-ms.chanrequest: // when closed
+			//	return
 			case <-stopsend.C:
 				return
 			default:
@@ -437,7 +432,7 @@ func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) 
 		}()
 	} else {
 		ms.mu.Unlock()
-		close(rcv)
+		//close(rcv)
 		return nil, fmt.Errorf("infinite request channel has been closed")
 	}
 	ms.mu.Unlock()
@@ -761,19 +756,19 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 			}
 			ms.mu.Unlock()
 		case <-ms.closeSend:
-			//ms.mu.Lock()
+			ms.mu.Lock()
 			if !isStopSignalSet {
-				logger.Debugw("lookup patch", "infinite writer", "stopping in 30s", "for", ms.p.String())
+				logger.Debugw("lookup patch", "infinite writer", "stopping in 0s", "for", ms.p.String())
 
 				go func() {
-					time.Sleep(30 * time.Second)
+					defer close(sendNotif)
+					//time.Sleep(30 * time.Second)
 					sendNotif <- struct{}{}
-					close(sendNotif)
 
 				}()
 				isStopSignalSet = true
 			}
-			//ms.mu.Unlock()
+			ms.mu.Unlock()
 		case <-stopWriterNotif:
 			logger.Debugw("lookup patch", "infinite writer", "closing all channels", "for", ms.p.String())
 			ms.mu.Lock()
@@ -793,10 +788,10 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 				delete(ms.chanMap, msid)
 			}
 			ms.mu2.Unlock()
-			ms.mu.Unlock()
 
-			close(ms.chanrequest)
-			close(ms.chanmessage)
+			//close(ms.chanrequest)
+			//close(ms.chanmessage)
+			ms.mu.Unlock()
 			logger.Debugw("lookup patch", "infinite writer", "stopped", "for", ms.p.String())
 			return
 

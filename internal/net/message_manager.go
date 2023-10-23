@@ -28,10 +28,11 @@ import (
 	pb "github.com/libp2p/go-libp2p-kad-dht/pb"
 )
 
-var dhtReadMessageTimeout = 5 * time.Second        //@Hive: Setting the timeout to 5s
-var dhtMessageSenderTimeout = 1 * time.Second      //@Hive: Adding timeout when creating Sender
-var dhtDefaultBackoffTime = 60 * time.Second       //@Hive: 1mn Backoff time for unresponsive peers
-var SmallReadWriteInterval = 10 * time.Millisecond // 25 writes per second
+var dhtReadMessageTimeout = 5 * time.Second            //@Hive: Setting the timeout to 5s
+var dhtMessageSenderTimeout = 1 * time.Second          //@Hive: Adding timeout when creating Sender
+var CumulatedDhtMessageSenderTimeout = 2 * time.Second //@Hive: cumulated time out for opening Sender => 1 retry
+var dhtDefaultBackoffTime = 60 * time.Second           //@Hive: 1mn Backoff time for unresponsive peers
+var SmallReadWriteInterval = 10 * time.Millisecond     // 25 writes per second
 
 // ErrReadTimeout is an error that occurs when no message is read within the timeout period.
 var ErrReadTimeout = fmt.Errorf("timed out reading response")
@@ -125,36 +126,53 @@ func (m *messageSenderImpl) SendRequest(ctx context.Context, p peer.ID, pmes *pb
 	ctx, _ = tag.New(ctx, metrics.UpsertMessageType(pmes))
 	ctxfast, cancelfast := context.WithTimeout(ctx, dhtMessageSenderTimeout)
 	defer cancelfast()
-	msender, err := m.messageSenderForPeer(ctxfast, p)
-	if err != nil {
-		stats.Record(ctx,
-			metrics.SentRequests.M(1),
-			metrics.SentRequestErrors.M(1),
-		)
-		logger.Debugw("request failed to open message sender", "error", err, "to", p)
-		return nil, fmt.Errorf("timed out openning message sender to: %s", p.String())
-	} else {
-		ms := msender
-		start := time.Now()
+	msenderChan := make(chan peerInitInfo)
+	go func(mchan chan<- peerInitInfo) {
+		defer close(mchan)
+		msender, err := m.messageSenderForPeer(ctxfast, p)
+		mchan <- peerInitInfo{sender: msender, errs: err}
+	}(msenderChan)
 
-		rpmes, err := ms.SendRequest(ctx, pmes)
-		if err != nil {
+	t := time.NewTimer(CumulatedDhtMessageSenderTimeout)
+	defer t.Stop()
+	select {
+	case ret := <-msenderChan:
+		if ret.errs != nil {
+			err := ret.errs
 			stats.Record(ctx,
 				metrics.SentRequests.M(1),
 				metrics.SentRequestErrors.M(1),
 			)
-			logger.Debugw("request failed", "error", err, "to", p)
+			logger.Debugw("request failed to open message sender", "error", err, "to", p)
+			return nil, fmt.Errorf("timed out openning message sender to: %s", p.String())
+		} else {
+			ms := ret.sender
+			start := time.Now()
 
-			return nil, err
+			rpmes, err := ms.SendRequest(ctx, pmes)
+			if err != nil {
+				stats.Record(ctx,
+					metrics.SentRequests.M(1),
+					metrics.SentRequestErrors.M(1),
+				)
+				logger.Debugw("request failed", "error", err, "to", p)
+
+				return nil, err
+			}
+
+			stats.Record(ctx,
+				metrics.SentRequests.M(1),
+				metrics.SentBytes.M(int64(pmes.Size())),
+				metrics.OutboundRequestLatency.M(float64(time.Since(start))/float64(time.Millisecond)),
+			)
+			m.host.Peerstore().RecordLatency(p, time.Since(start))
+			return rpmes, nil
 		}
 
-		stats.Record(ctx,
-			metrics.SentRequests.M(1),
-			metrics.SentBytes.M(int64(pmes.Size())),
-			metrics.OutboundRequestLatency.M(float64(time.Since(start))/float64(time.Millisecond)),
-		)
-		m.host.Peerstore().RecordLatency(p, time.Since(start))
-		return rpmes, nil
+	case <-t.C:
+		err := fmt.Errorf("hard message sender timed out")
+		logger.Debugw("request failed to open message sender", "error", err, "to", p)
+		return nil, fmt.Errorf("hard timed out openning message sender to: %s", p.String())
 	}
 
 }
@@ -164,32 +182,48 @@ func (m *messageSenderImpl) SendMessage(ctx context.Context, p peer.ID, pmes *pb
 	ctx, _ = tag.New(ctx, metrics.UpsertMessageType(pmes))
 	ctxfast, cancelfast := context.WithTimeout(ctx, dhtMessageSenderTimeout)
 	defer cancelfast()
-	msender, err := m.messageSenderForPeer(ctxfast, p)
-	if err != nil {
-		stats.Record(ctx,
-			metrics.SentMessages.M(1),
-			metrics.SentMessageErrors.M(1),
-		)
-		logger.Debugw("request failed to open message sender", "error", err, "to", p)
-		return fmt.Errorf("timed out openning message sender to: %s", p.String())
-	} else {
-		ms := msender
-		err := ms.SendMessage(ctx, pmes)
-		if err != nil {
+	msenderChan := make(chan peerInitInfo)
+	go func(mchan chan<- peerInitInfo) {
+		defer close(mchan)
+		msender, err := m.messageSenderForPeer(ctxfast, p)
+		mchan <- peerInitInfo{sender: msender, errs: err}
+	}(msenderChan)
+	t := time.NewTimer(CumulatedDhtMessageSenderTimeout)
+	defer t.Stop()
+	select {
+	case ret := <-msenderChan:
+		if ret.errs != nil {
+			err := ret.errs
 			stats.Record(ctx,
 				metrics.SentMessages.M(1),
 				metrics.SentMessageErrors.M(1),
 			)
-			logger.Debugw("request failed", "error", err, "to", p)
+			logger.Debugw("request failed to open message sender", "error", err, "to", p)
+			return fmt.Errorf("timed out openning message sender to: %s", p.String())
+		} else {
+			ms := ret.sender
+			err := ms.SendMessage(ctx, pmes)
+			if err != nil {
+				stats.Record(ctx,
+					metrics.SentMessages.M(1),
+					metrics.SentMessageErrors.M(1),
+				)
+				logger.Debugw("request failed", "error", err, "to", p)
 
-			return err
+				return err
+			}
+
+			stats.Record(ctx,
+				metrics.SentMessages.M(1),
+				metrics.SentBytes.M(int64(pmes.Size())),
+			)
+			return nil
 		}
+	case <-t.C:
+		err := fmt.Errorf("hard message sender timed out")
+		logger.Debugw("request failed to open message sender", "error", err, "to", p)
+		return fmt.Errorf("hard timed out openning message sender to: %s", p.String())
 
-		stats.Record(ctx,
-			metrics.SentMessages.M(1),
-			metrics.SentBytes.M(int64(pmes.Size())),
-		)
-		return nil
 	}
 
 }
@@ -197,7 +231,7 @@ func (m *messageSenderImpl) SendMessage(ctx context.Context, p peer.ID, pmes *pb
 func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID) (*peerMessageSender, error) {
 	m.smlk.Lock()
 	ms, ok := m.strmap[p]
-	if ok {
+	if ok && ms.running {
 		m.smlk.Unlock()
 		return ms, nil
 	}
@@ -206,11 +240,11 @@ func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID)
 		chanrequest: make(chan MessageInfo), chanmessage: make(chan MessageInfo), running: false}
 	m.strmap[p] = ms
 
-	m.smlk.Unlock()
-
+	//m.smlk.Unlock()
+	defer m.smlk.Unlock()
 	if err := ms.prepOrInvalidate(ctx); err != nil {
-		m.smlk.Lock()
-		defer m.smlk.Unlock()
+		//m.smlk.Lock()
+		//defer m.smlk.Unlock()
 
 		if msCur, ok := m.strmap[p]; ok {
 			// Changed. Use the new one, old one is invalid and

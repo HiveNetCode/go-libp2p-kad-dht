@@ -28,11 +28,12 @@ import (
 	pb "github.com/libp2p/go-libp2p-kad-dht/pb"
 )
 
-var dhtReadMessageTimeout = 5 * time.Second            //@Hive: Setting the timeout to 5s
+var dhtReadMessageTimeout = 3 * time.Second            //@Hive: Setting the timeout to 5s
 var dhtMessageSenderTimeout = 1 * time.Second          //@Hive: Adding timeout when creating Sender
 var CumulatedDhtMessageSenderTimeout = 2 * time.Second //@Hive: cumulated time out for opening Sender => 1 retry
-var dhtDefaultBackoffTime = 60 * time.Second           //@Hive: 1mn Backoff time for unresponsive peers
+var dhtDefaultBackoffTime = 20 * time.Second           //@Hive: 1mn Backoff time for unresponsive peers
 var SmallReadWriteInterval = 10 * time.Millisecond     // 25 writes per second
+var MaxRetries = 1
 
 // ErrReadTimeout is an error that occurs when no message is read within the timeout period.
 var ErrReadTimeout = fmt.Errorf("timed out reading response")
@@ -407,7 +408,7 @@ func (ms *peerMessageSender) UpdateUnresponsiveMap() {
 	if !ms.isResponsive {
 		if time.Since(ms.addTime).Seconds() >= ms.backoffTime.Seconds() {
 			ms.addTime = time.Now()
-			ms.backoffTime *= 2
+			ms.backoffTime = dhtDefaultBackoffTime //*= 2
 			logger.Debugw("lookup patch", "exponential backoff for peer", ms.p, "new backoff (s)", ms.backoffTime.Seconds())
 			//logger.Infow("lookup patch", "new backoff time(s)", ms.backoffTime.Seconds())
 		}
@@ -432,67 +433,88 @@ func (ms *peerMessageSender) SendEarlyErrorToAll(err error) {
 }
 
 func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) (*pb.Message, error) {
-	ms.mu.Lock()
-	if !ms.running {
-		ms.mu.Unlock()
-		return nil, fmt.Errorf("infinite writer is not running")
-	}
-	if err, unresponsive := ms.IsUnresponsivePeer(); unresponsive {
-		logger.Debugw("lookup patch", "error", err, "to", ms.p, "request type", pmes.GetType().String())
-		ms.mu.Unlock()
-		return nil, err
-	}
-	ms.SetRequestId(pmes)
-	msid := GenerateRequestId(pmes)
-	//ms.mu.Unlock()
-	rcv := make(chan MultiMessageResponse)
-	messageWithInfo := MessageInfo{
-		message:  pmes,
-		err:      nil,
-		receiver: rcv,
-		ctx:      ctx,
-	}
-	if ms.running {
-		go func() {
-			stopsend := time.NewTimer(2 * time.Second)
-			select {
-			//case <-ms.chanrequest: // when closed
-			//	return
-			case <-stopsend.C:
-				return
-			default:
-				ms.chanrequest <- messageWithInfo
-			}
-		}()
-	} else {
-		ms.mu.Unlock()
-		//close(rcv)
-		return nil, fmt.Errorf("infinite request channel has been closed")
-	}
-	ms.mu.Unlock()
-
-	t := time.NewTimer(dhtReadMessageTimeout)
-	defer t.Stop()
-	select {
-	case ret := <-rcv:
-		if ret.err != nil {
-			ms.mu.Lock()
-			ms.UpdateUnresponsiveMap()
-			ms.mu.Unlock()
-		}
-		return ret.message, ret.err
-
-	case <-t.C:
+	//attempts := 0
+	retry := true
+	for {
 		ms.mu.Lock()
-		ms.mu2.Lock()
-		if ch, ok := ms.chanMap[msid]; ok {
-			close(ch)
-			delete(ms.chanMap, msid)
+		if !ms.running {
+			ms.mu.Unlock()
+			return nil, fmt.Errorf("infinite writer is not running")
 		}
-		ms.mu2.Unlock()
-		ms.UpdateUnresponsiveMap()
+		if err, unresponsive := ms.IsUnresponsivePeer(); unresponsive {
+			logger.Debugw("lookup patch", "error", err, "to", ms.p, "request type", pmes.GetType().String())
+			ms.mu.Unlock()
+			return nil, err
+		}
+		ms.SetRequestId(pmes)
+		msid := GenerateRequestId(pmes)
+		//ms.mu.Unlock()
+		rcv := make(chan MultiMessageResponse)
+		messageWithInfo := MessageInfo{
+			message:  pmes,
+			err:      nil,
+			receiver: rcv,
+			ctx:      ctx,
+		}
+		if ms.running {
+			go func() {
+				stopsend := time.NewTimer(2 * time.Second)
+				select {
+				//case <-ms.chanrequest: // when closed
+				//	return
+				case <-stopsend.C:
+					return
+				default:
+					ms.chanrequest <- messageWithInfo
+				}
+			}()
+		} else {
+			ms.mu.Unlock()
+			//close(rcv)
+			return nil, fmt.Errorf("infinite request channel has been closed")
+		}
 		ms.mu.Unlock()
-		return nil, ErrReadTimeout
+
+		t := time.NewTimer(dhtReadMessageTimeout)
+		defer t.Stop()
+		//for {
+		select {
+		case ret := <-rcv:
+			/*if ret.err != nil {
+				ms.mu.Lock()
+				ms.UpdateUnresponsiveMap()
+				ms.mu.Unlock()
+			}*/
+			return ret.message, ret.err
+
+		case <-t.C:
+			ms.mu.Lock()
+			ms.mu2.Lock()
+			if ch, ok := ms.chanMap[msid]; ok {
+				close(ch)
+				delete(ms.chanMap, msid)
+			}
+			ms.mu2.Unlock()
+			if err, unresponsive := ms.IsUnresponsivePeer(); unresponsive {
+				logger.Debugw("lookup patch", "error", err, "to", ms.p, "request type", pmes.GetType().String())
+
+				ms.mu.Unlock()
+				return nil, err
+			}
+			if retry /*attempts < MaxRetries*/ {
+				ms.mu.Unlock()
+				logger.Debugw("lookup patch", "error", ErrReadTimeout, "from", ms.p, "retrying", retry)
+				//logger.Debugw("lookup patch", "error", ErrReadTimeout,"from",ms.p, "retrying", true)
+				retry = false
+				continue
+			} else {
+				//ms.mu2.Unlock()
+				//ms.mu.Lock()
+				ms.UpdateUnresponsiveMap()
+				ms.mu.Unlock()
+				return nil, ErrReadTimeout
+			}
+		}
 	}
 }
 
@@ -665,58 +687,75 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 		select {
 		case reqinfo := <-ms.chanrequest:
 			ms.mu.Lock()
+
 			if err, unresponsive := ms.IsUnresponsivePeer(); !unresponsive {
 				//ms.SetRequestId(reqinfo.message)
+				//attempt := 0
+				retry := false
 				msid := GenerateRequestId(reqinfo.message)
 				ms.mu2.Lock()
 				ms.chanMap[msid] = reqinfo.receiver
 				ms.mu2.Unlock()
-				if err := ms.prep(reqinfo.ctx); err != nil {
-					go func(rcv chan MultiMessageResponse, errc error) {
-						defer close(rcv)
-						stopsend := time.NewTimer(2 * time.Second)
-						select {
-						case <-stopsend.C:
-							return
-						default:
-							rcv <- MultiMessageResponse{message: nil, err: errc}
-						}
+				for {
+					//attempt +=1
+					if err := ms.prep(reqinfo.ctx); err != nil {
+						go func(rcv chan MultiMessageResponse, errc error) {
+							defer close(rcv)
+							stopsend := time.NewTimer(2 * time.Second)
+							select {
+							case <-stopsend.C:
+								return
+							default:
+								rcv <- MultiMessageResponse{message: nil, err: errc}
+							}
 
-					}(reqinfo.receiver, err)
-					ms.mu2.Lock()
-					delete(ms.chanMap, msid)
-					ms.mu2.Unlock()
-				} else if err := ms.writeMsg(reqinfo.message); err != nil {
-					_ = ms.s.Reset()
-					ms.s = nil
-					go func(rcv chan MultiMessageResponse, errc error) {
-						defer close(rcv)
-						stopsend := time.NewTimer(2 * time.Second)
-						select {
-						case <-stopsend.C:
-							return
-						default:
-							rcv <- MultiMessageResponse{message: nil, err: errc}
+						}(reqinfo.receiver, err)
+						ms.mu2.Lock()
+						delete(ms.chanMap, msid)
+						ms.mu2.Unlock()
+						break
+					} else if err := ms.writeMsg(reqinfo.message); err != nil {
+						_ = ms.s.Reset()
+						ms.s = nil
+						if retry {
+							go func(rcv chan MultiMessageResponse, errc error) {
+								defer close(rcv)
+								stopsend := time.NewTimer(2 * time.Second)
+								select {
+								case <-stopsend.C:
+									return
+								default:
+									rcv <- MultiMessageResponse{message: nil, err: errc}
+								}
+							}(reqinfo.receiver, err)
+							//ms.UpdateUnresponsiveMap()
+							logger.Debugw("lookup patch", "infinite writer", "error while writing request", "to", ms.p.String(), "error", err)
+							ms.mu2.Lock()
+							delete(ms.chanMap, msid)
+							ms.mu2.Unlock()
+							//logger.Debugw("error writing message", "error", err)
+							//return err
+							break
 						}
-					}(reqinfo.receiver, err)
-					ms.UpdateUnresponsiveMap()
-					logger.Debugw("lookup patch", "infinite writer", "error while writing request", "to", ms.p.String(), "error", err)
-					ms.mu2.Lock()
-					delete(ms.chanMap, msid)
-					ms.mu2.Unlock()
-				} else {
-					time.Sleep(SmallReadWriteInterval) // time space between writes (pacing)
-					go func() {
-						stopsend := time.NewTimer(2 * time.Second)
-						select {
-						case <-stopsend.C:
-							return
-						default:
-							readNotif <- struct{}{}
-						}
+						logger.Debugw("lookup patch", "infinite writer", "error while writing request", "error", err, "retrying", true)
+						retry = true
+						continue
 
-					}()
-					// nothing for now
+					} else {
+						time.Sleep(SmallReadWriteInterval) // time space between writes (pacing)
+						go func() {
+							stopsend := time.NewTimer(2 * time.Second)
+							select {
+							case <-stopsend.C:
+								return
+							default:
+								readNotif <- struct{}{}
+							}
+
+						}()
+						break
+						// nothing for now
+					}
 				}
 
 			} else {
@@ -737,43 +776,55 @@ func (ms *peerMessageSender) InfiniteReader(ctx context.Context) {
 		case minfo := <-ms.chanmessage:
 			ms.mu.Lock()
 			if err, unresponsive := ms.IsUnresponsivePeer(); !unresponsive {
-				if err := ms.prep(minfo.ctx); err != nil {
-					go func(rcv chan MultiMessageResponse, errc error) {
-						defer close(rcv)
-						stopsend := time.NewTimer(2 * time.Second)
-						select {
-						case <-stopsend.C:
-							return
-						default:
-							rcv <- MultiMessageResponse{message: nil, err: errc}
+				retry := false
+				for {
+					if err := ms.prep(minfo.ctx); err != nil {
+						go func(rcv chan MultiMessageResponse, errc error) {
+							defer close(rcv)
+							stopsend := time.NewTimer(2 * time.Second)
+							select {
+							case <-stopsend.C:
+								return
+							default:
+								rcv <- MultiMessageResponse{message: nil, err: errc}
+							}
+						}(minfo.receiver, err)
+						break
+					} else if err := ms.writeMsg(minfo.message); err != nil {
+						_ = ms.s.Reset()
+						ms.s = nil
+						if retry {
+							go func(rcv chan MultiMessageResponse, errc error) {
+								defer close(rcv)
+								stopsend := time.NewTimer(2 * time.Second)
+								select {
+								case <-stopsend.C:
+									return
+								default:
+									rcv <- MultiMessageResponse{message: nil, err: errc}
+								}
+							}(minfo.receiver, err)
+							//ms.UpdateUnresponsiveMap()
+							logger.Debugw("lookup patch", "infinite writer", "error while writing message", "to", ms.p.String(), "error", err)
+							break
 						}
-					}(minfo.receiver, err)
-				} else if err := ms.writeMsg(minfo.message); err != nil {
-					_ = ms.s.Reset()
-					ms.s = nil
-					go func(rcv chan MultiMessageResponse, errc error) {
-						defer close(rcv)
-						stopsend := time.NewTimer(2 * time.Second)
-						select {
-						case <-stopsend.C:
-							return
-						default:
-							rcv <- MultiMessageResponse{message: nil, err: errc}
-						}
-					}(minfo.receiver, err)
-					ms.UpdateUnresponsiveMap()
-					logger.Debugw("lookup patch", "infinite writer", "error while writing message", "to", ms.p.String(), "error", err)
-				} else {
-					go func(rcv chan MultiMessageResponse, errc error) {
-						defer close(rcv)
-						stopsend := time.NewTimer(2 * time.Second)
-						select {
-						case <-stopsend.C:
-							return
-						default:
-							rcv <- MultiMessageResponse{message: nil, err: errc}
-						}
-					}(minfo.receiver, nil)
+						logger.Debugw("lookup patch", "infinite writer", "error while writing message", "error", err, "retrying", true)
+						retry = true
+						continue
+
+					} else {
+						go func(rcv chan MultiMessageResponse, errc error) {
+							defer close(rcv)
+							stopsend := time.NewTimer(2 * time.Second)
+							select {
+							case <-stopsend.C:
+								return
+							default:
+								rcv <- MultiMessageResponse{message: nil, err: errc}
+							}
+						}(minfo.receiver, nil)
+						break
+					}
 				}
 
 			} else {

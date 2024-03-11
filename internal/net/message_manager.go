@@ -317,6 +317,7 @@ func (ms *peerMessageSender) SendMessage(ctx context.Context, pmes *pb.Message) 
 		//ms.writeMutex.Unlock()
 		go func() {
 			stopsend := time.NewTimer(2 * time.Second) // timeout for writing to the Writer channel
+			defer stopsend.Stop()
 			select {
 			case <-stopsend.C:
 				return
@@ -518,7 +519,7 @@ func (ms *peerMessageSender) runInfiniteWriter(ctx context.Context) {
 	// Main loop for writing requests and messages and handling write errors
 	for {
 		select {
-		// when go routine is stopped, on remote peer disconnect()
+		// close go routine when remote peer (ms.p) is stopped, based on signal received from OnDisconnect() function
 		case <-ms.infiniteRwCtx.Done():
 			logger.Debugw("lookup patch", "infinite writer", "stopped", "for", ms.p.String())
 			return
@@ -530,7 +531,7 @@ func (ms *peerMessageSender) runInfiniteWriter(ctx context.Context) {
 		case request := <-ms.chanrequest:
 			ms.handleRequestWrite(request)
 		default:
-			time.Sleep(SmallReadWriteInterval) // time space between reads (pacing)
+			time.Sleep(SmallReadWriteInterval) // time space between writes (pacing)
 		}
 	}
 
@@ -542,6 +543,7 @@ func (ms *peerMessageSender) runInfiniteReader(ctx context.Context) {
 	// Main loop for reading responses and handling delivery via receive channels
 	for {
 		select {
+		// close go routine when remote peer (ms.p) is stopped, based on signal received from OnDisconnect() function
 		case <-ms.infiniteRwCtx.Done():
 			logger.Debugw("lookup patch", "infinite reader", "stopped", "for", ms.p.String())
 			return

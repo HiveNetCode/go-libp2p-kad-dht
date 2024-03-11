@@ -518,6 +518,7 @@ func (ms *peerMessageSender) runInfiniteWriter(ctx context.Context) {
 
 	// Main loop for writing requests and messages and handling write errors
 	for {
+		time.Sleep(SmallReadWriteInterval) // time space between writes (pacing)
 		select {
 		// close go routine when remote peer (ms.p) is stopped, based on signal received from OnDisconnect() function
 		case <-ms.infiniteRwCtx.Done():
@@ -531,7 +532,7 @@ func (ms *peerMessageSender) runInfiniteWriter(ctx context.Context) {
 		case request := <-ms.chanrequest:
 			ms.handleRequestWrite(request)
 		default:
-			time.Sleep(SmallReadWriteInterval) // time space between writes (pacing)
+
 		}
 	}
 
@@ -542,13 +543,13 @@ func (ms *peerMessageSender) runInfiniteReader(ctx context.Context) {
 
 	// Main loop for reading responses and handling delivery via receive channels
 	for {
+		time.Sleep(SmallReadWriteInterval) // time space between reads (pacing)
 		select {
 		// close go routine when remote peer (ms.p) is stopped, based on signal received from OnDisconnect() function
 		case <-ms.infiniteRwCtx.Done():
 			logger.Debugw("lookup patch", "infinite reader", "stopped", "for", ms.p.String())
 			return
 		default:
-			time.Sleep(SmallReadWriteInterval) // time space between reads (pacing)
 			ms.handleRequestRead()
 		}
 

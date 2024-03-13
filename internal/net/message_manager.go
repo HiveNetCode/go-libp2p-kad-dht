@@ -87,6 +87,9 @@ func (m *messageSenderImpl) OnDisconnect(ctx context.Context, p peer.ID) {
 	if ms.running {
 		ms.infiniteRwClose()
 		ms.running = false
+		close(ms.chanmessage)
+		close(ms.chanrequest)
+
 	}
 
 }
@@ -179,7 +182,7 @@ func (m *messageSenderImpl) SendMessage(ctx context.Context, p peer.ID, pmes *pb
 func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID) (*peerMessageSender, error) {
 	m.smlk.Lock()
 	ms, ok := m.strmap[p]
-	if ok && ms.running { // return message sender only if the writer/Reader are running
+	if ok { // return message sender only if the writer/Reader are running
 		m.smlk.Unlock()
 		return ms, nil
 	}
@@ -292,61 +295,77 @@ func (ms *peerMessageSender) prep(ctx context.Context) error {
 }
 
 func (ms *peerMessageSender) SendMessage(ctx context.Context, pmes *pb.Message) error {
+	// no need to create ID, messages don't have answers like requests.
+	// The remote peer doesn't answer to messages.
+	err := func() (err error) {
+		ms.writeMutex.Lock()
+		defer ms.writeMutex.Unlock()
+		if !ms.running {
+			err = fmt.Errorf("infinite writer is not running")
+			return
+		}
+		var unresponsive bool
+		if err, unresponsive = ms.IsUnresponsivePeer(); unresponsive {
+			logger.Debugw("lookup patch", "error", err, "to", ms.p, "message type", pmes.GetType().String())
+			return
+		}
+		return
 
-	ms.writeMutex.Lock()
-	if !ms.running {
-		ms.writeMutex.Unlock()
-		return fmt.Errorf("infinite writer is not running")
-	}
-	if err, unresponsive := ms.IsUnresponsivePeer(); unresponsive {
+	}()
 
-		logger.Debugw("lookup patch", "error", err, "to", ms.p, "message type", pmes.GetType().String())
-		ms.writeMutex.Unlock()
+	if err != nil {
 		return err
 	}
-	//ms.writeMutex.Unlock()
-	rcv := make(chan MetaMessage)
-	messageWithInfo := MessageInfo{
-		message:  pmes,
-		err:      nil,
-		receiver: rcv,
-		ctx:      ctx,
-	}
+	isInfReaderWriterRunning := func() (running bool) {
+		ms.writeMutex.Lock()
+		defer ms.writeMutex.Unlock()
+		return ms.running
 
-	if ms.running {
-		//ms.writeMutex.Unlock()
-		go func() {
-			stopsend := time.NewTimer(2 * time.Second) // timeout for writing to the Writer channel
-			defer stopsend.Stop()
-			select {
-			case <-stopsend.C:
-				return
-			default:
-				ms.chanmessage <- messageWithInfo
-			}
-		}()
-	} else {
-		ms.writeMutex.Unlock()
-		close(rcv)
-		//ms.writeMutex.Unlock()
-		return fmt.Errorf("infinite request channel has been closed")
-	}
-	ms.writeMutex.Unlock()
-	t := time.NewTimer(dhtReadMessageTimeout)
-	defer t.Stop()
-	select {
-	case ret := <-rcv:
-		if ret.err != nil {
-			ms.writeMutex.Lock()
-			ms.UpdateUnresponsiveMap()
-			ms.writeMutex.Unlock()
+	}()
+	if isInfReaderWriterRunning {
+		rcv := make(chan MetaMessage)
+		defer close(rcv)
+		messageWithInfo := MessageInfo{
+			message:  pmes,
+			err:      nil,
+			receiver: rcv,
+			ctx:      ctx,
 		}
-		return ret.err
-	case <-t.C:
-		return ErrReadTimeout
+		// Send packaged request to infinite writer via the request channel
+		stopsend := time.NewTimer(2 * time.Second) // timeout for writing to the Writer channel
+		defer stopsend.Stop()
+		select {
+		case <-ms.infiniteRwCtx.Done():
+			return fmt.Errorf("infinite message channel has been closed")
+		case <-stopsend.C:
+			return fmt.Errorf("timed out while writing on message channel")
+		case ms.chanmessage <- messageWithInfo:
+		}
+
+		//ms.chanmessage <- messageWithInfo
+		t := time.NewTimer(dhtReadMessageTimeout)
+		defer t.Stop()
+		select {
+		case ret := <-rcv:
+			if ret.err != nil {
+				ms.writeMutex.Lock()
+				ms.UpdateUnresponsiveMap()
+				ms.writeMutex.Unlock()
+			}
+			return ret.err
+		case <-t.C:
+			return ErrReadTimeout
+		}
+
+	} else {
+		return fmt.Errorf("infinite message channel has been closed")
 	}
 
 }
+
+// A call of this function marks ms.p as unresponsive if it wasn't already.
+// The peer is marked unresponsive for a initial backoff time of 60s.
+// The backoff time increases exponentially (*2) if the function is called after the backoff time.
 func (ms *peerMessageSender) UpdateUnresponsiveMap() {
 	if !ms.isResponsive {
 		if time.Since(ms.addTime).Seconds() >= ms.backoffTime.Seconds() {
@@ -364,71 +383,85 @@ func (ms *peerMessageSender) UpdateUnresponsiveMap() {
 }
 
 func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) (*pb.Message, error) {
-	ms.writeMutex.Lock()
-	if !ms.running {
-		ms.writeMutex.Unlock()
-		return nil, fmt.Errorf("infinite writer is not running")
-	}
-	if err, unresponsive := ms.IsUnresponsivePeer(); unresponsive {
-		logger.Debugw("lookup patch", "error", err, "to", ms.p, "request type", pmes.GetType().String())
-		ms.writeMutex.Unlock()
+	requestID, err := func() (id string, err error) {
+		ms.writeMutex.Lock()
+		defer ms.writeMutex.Unlock()
+		if !ms.running {
+			err = fmt.Errorf("infinite writer is not running")
+			return
+		}
+		var unresponsive bool
+		if err, unresponsive = ms.IsUnresponsivePeer(); unresponsive {
+			logger.Debugw("lookup patch", "error", err, "to", ms.p, "request type", pmes.GetType().String())
+			return
+		}
+		ms.SetRequestId(pmes)
+		id = GetRequestId(pmes)
+		return
+
+	}()
+
+	if err != nil {
 		return nil, err
 	}
-	// Add a request ID in the ClusterRaw field
-	ms.SetRequestId(pmes)
-	requestID := GetRequestId(pmes)
 
-	rcv := make(chan MetaMessage)
-	messageWithInfo := MessageInfo{
-		message:  pmes,
-		err:      nil,
-		receiver: rcv,
-		ctx:      ctx,
-	}
-	if ms.running {
-		ms.writeMutex.Unlock()
-		go func() {
-			stopsend := time.NewTimer(2 * time.Second) // timeout for writing to the Writer channel
-			defer stopsend.Stop()
-			select {
-			case <-stopsend.C:
-				return
-			default:
-				ms.chanrequest <- messageWithInfo
-			}
+	isInfReaderWriterRunning := func() (running bool) {
+		ms.writeMutex.Lock()
+		defer ms.writeMutex.Unlock()
+		return ms.running
+	}()
+	if isInfReaderWriterRunning {
+		rcv := make(chan MetaMessage)
+		defer func() {
+			// Delete the request ID and the chan from the Map
+			ms.chanMapMutex.Lock()
+			defer ms.chanMapMutex.Unlock()
+			delete(ms.chanMap, requestID)
+			//close(rcv)
 		}()
-	} else {
-		ms.writeMutex.Unlock()
-		//close(rcv)
-		return nil, fmt.Errorf("infinite request channel has been closed")
-	}
+		messageWithInfo := MessageInfo{
+			message:  pmes,
+			err:      nil,
+			receiver: rcv,
+			ctx:      ctx,
+		}
+		// Send packaged request to infinite writer via the request channel
+		stopsend := time.NewTimer(2 * time.Second) // timeout for writing to the Writer channel
+		defer stopsend.Stop()
+		select {
+		case <-ms.infiniteRwCtx.Done():
+			close(rcv)
+			return nil, fmt.Errorf("infinite message channel has been closed")
+		case <-stopsend.C:
+			close(rcv)
+			return nil, fmt.Errorf("timed out while writing on message channel")
+		case ms.chanrequest <- messageWithInfo:
+		}
 
-	t := time.NewTimer(dhtReadMessageTimeout)
-	defer t.Stop()
-	select {
-	case ret := <-rcv:
-		if ret.err != nil {
+		//ms.chanrequest <- messageWithInfo
+		// Define a ReadTimeout of 5s
+		t := time.NewTimer(dhtReadMessageTimeout)
+		defer t.Stop()
+		select {
+		case ret := <-rcv:
+			if ret.err != nil {
+				ms.writeMutex.Lock()
+				ms.UpdateUnresponsiveMap()
+				ms.writeMutex.Unlock()
+			}
+			return ret.message, ret.err
+
+		case <-t.C:
+			// flag the peer as unresponsive sice a timeout occurs
 			ms.writeMutex.Lock()
 			ms.UpdateUnresponsiveMap()
 			ms.writeMutex.Unlock()
+			return nil, ErrReadTimeout
 		}
-		return ret.message, ret.err
-
-	case <-t.C:
-		// flag the peer as unresponsive sice a timeout occurs
-		ms.writeMutex.Lock()
-		ms.UpdateUnresponsiveMap()
-		ms.writeMutex.Unlock()
-		// Delete the request ID and the chan from the Map
-		ms.chanMapMutex.Lock()
-		if ch, ok := ms.chanMap[requestID]; ok {
-			close(ch)
-			delete(ms.chanMap, requestID)
-		}
-		ms.chanMapMutex.Unlock()
-
-		return nil, ErrReadTimeout
+	} else {
+		return nil, fmt.Errorf("infinite request channel has been closed")
 	}
+
 }
 
 func (ms *peerMessageSender) writeMsg(pmes *pb.Message) error {
@@ -471,6 +504,7 @@ func (w *bufferedDelimitedWriter) Flush() error {
 
 /*** HIVE PATCH *****/
 
+// construct and return request ID based on message type, key and ClusterLevelRaw fields
 func GetRequestId(pmes *pb.Message) string {
 	requestID := ""
 
@@ -486,11 +520,16 @@ func GetRequestId(pmes *pb.Message) string {
 	return requestID
 }
 
+// This function insert a unique ID into the ClusterLevelRaw field of a message (1000<ID<11000).
+// ClusterLevelRaw is set by default to 0, but is not used currently by kad-dht.
+// This function is called before sending the message to the remote peer.
 func (ms *peerMessageSender) SetRequestId(pmes *pb.Message) {
 	ms.messageId = (ms.messageId + 1) % 10000
 	pmes.SetClusterLevel(ms.messageId + 1000)
 }
 
+// This function restores the ClusterLevelRaw field of a message to its original value (0).
+// This function is called when the response is received from the remote peer
 func (ms *peerMessageSender) RestoreRequestInfo(pmes *pb.Message) {
 	pmes.SetClusterLevel(0)
 }
@@ -508,11 +547,14 @@ type MetaMessage struct {
 	err     error
 }
 
+// Launch the InfiniteWriter and the InfiniteReader in two separate goroutines
 func (ms *peerMessageSender) runInfReaderAndWriter(ctx context.Context) {
 	go ms.runInfiniteWriter(ctx)
 	go ms.runInfiniteReader(ctx)
 }
 
+// Receives messages and requests through chanrequest and chanmessage channels,
+// then write them to the remote peer one at a time (using a Write Lock)
 func (ms *peerMessageSender) runInfiniteWriter(ctx context.Context) {
 	logger.Debugw("lookup patch", "infinite writer", "started", "for", ms.p.String())
 
@@ -520,10 +562,6 @@ func (ms *peerMessageSender) runInfiniteWriter(ctx context.Context) {
 	for {
 		time.Sleep(SmallReadWriteInterval) // time space between writes (pacing)
 		select {
-		// close go routine when remote peer (ms.p) is stopped, based on signal received from OnDisconnect() function
-		case <-ms.infiniteRwCtx.Done():
-			logger.Debugw("lookup patch", "infinite writer", "stopped", "for", ms.p.String())
-			return
 		// handle messages received from SendMessage().
 		// messages don't need response
 		case message := <-ms.chanmessage:
@@ -531,13 +569,21 @@ func (ms *peerMessageSender) runInfiniteWriter(ctx context.Context) {
 		// handle requests received from SendRequest()
 		case request := <-ms.chanrequest:
 			ms.handleRequestWrite(request)
+			// close go routine when remote peer (ms.p) is stopped, based on signal received from OnDisconnect() function
+		case <-ms.infiniteRwCtx.Done():
+			logger.Debugw("lookup patch", "infinite writer", "stopped", "for", ms.p.String())
+			return
 		default:
+			time.Sleep(SmallReadWriteInterval) // additional 10ms sleep since no activity
 
 		}
 	}
 
 }
 
+// Receive responses to requests from a remote peer,
+// then deliver them to the right sendRequest calls. This is done by delivering each response via
+// its corresponding receive channel.
 func (ms *peerMessageSender) runInfiniteReader(ctx context.Context) {
 	logger.Debugw("lookup patch", "infinite reader", "started", "for", ms.p.String())
 
@@ -557,78 +603,103 @@ func (ms *peerMessageSender) runInfiniteReader(ctx context.Context) {
 
 }
 
-func ReturnResponseViaChan(rcv chan MetaMessage, data *pb.Message, errc error) {
-	defer close(rcv)
-	// close the function/routine after 2 seconds
+// Return request response data or error via a receive channel.
+// and delete request ID entry from the Map
+func (ms *peerMessageSender) ReturnResponseViaChan(requestID string, rcv chan MetaMessage, data *pb.Message, errc error) {
+	defer func() {
+		ms.chanMapMutex.Lock()
+		defer ms.chanMapMutex.Unlock()
+		delete(ms.chanMap, requestID)
+
+	}()
+	// close the function after 2 Milliseconds
+	// because rcv is not used concurrently, so the write should be instantaneous
+	stopTimer := time.NewTimer(2 * time.Millisecond)
+	defer stopTimer.Stop()
+	select {
+	case <-stopTimer.C:
+		return
+	case rcv <- MetaMessage{message: data, err: errc}:
+		return
+	}
+}
+
+// Return message status (nil or error) via a receive channel.
+func (ms *peerMessageSender) ReturnMsgResponseViaChan(rcv chan MetaMessage, data *pb.Message, errc error) {
+	// close the function after 2 Milliseconds
+	// because rcv is not used concurrently, so the write should be instantaneous
 	stopTimer := time.NewTimer(2 * time.Second)
 	defer stopTimer.Stop()
 	select {
 	case <-stopTimer.C:
 		return
-	default:
-		rcv <- MetaMessage{message: data, err: errc}
+	case rcv <- MetaMessage{message: data, err: errc}:
+		return
 	}
 }
 
+// Write a message on a stream and return nil if ok or error otherwise.
+// Messages don't have responses, so no need to implement a handleMessageRead() function
 func (ms *peerMessageSender) handleMessageWrite(metaMessage MessageInfo) {
 	ms.writeMutex.Lock()
 	defer ms.writeMutex.Unlock()
 	// Check if the peer was recently flagged as unresponsive
 	if err, unresponsive := ms.IsUnresponsivePeer(); !unresponsive {
 		if err := ms.prep(metaMessage.ctx); err != nil {
-			ReturnResponseViaChan(metaMessage.receiver, nil, err)
+
+			ms.ReturnMsgResponseViaChan(metaMessage.receiver, nil, err)
 		} else if err := ms.writeMsg(metaMessage.message); err != nil {
 			_ = ms.s.Reset()
 			ms.s = nil
-			ReturnResponseViaChan(metaMessage.receiver, nil, err)
+			ms.ReturnMsgResponseViaChan(metaMessage.receiver, nil, err)
 			// flag the peer as unresponsive
 			ms.UpdateUnresponsiveMap()
 			logger.Debugw("lookup patch", "infinite writer", "error while writing message", "to", ms.p.String(), "error", err)
 		} else {
 			// no error
-			ReturnResponseViaChan(metaMessage.receiver, nil, nil)
+			ms.ReturnMsgResponseViaChan(metaMessage.receiver, nil, nil)
 		}
 
 	} else { // the peer is still considered unresponsive
-		ReturnResponseViaChan(metaMessage.receiver, nil, err)
+		ms.ReturnMsgResponseViaChan(metaMessage.receiver, nil, err)
 	}
 
 }
 
+// store request ID and receive channel in a Map, then
+// write the request on a stream. Return nil if ok or error otherwise.
 func (ms *peerMessageSender) handleRequestWrite(metaMessage MessageInfo) {
 	ms.writeMutex.Lock()
 	defer ms.writeMutex.Unlock()
+	requestID := GetRequestId(metaMessage.message)
 	// Check if the peer was recently flagged as unresponsive
 	if err, unresponsive := ms.IsUnresponsivePeer(); !unresponsive {
 		// store request ID and receive channel in order to deliver the response
-		requestID := GetRequestId(metaMessage.message)
 		ms.chanMapMutex.Lock()
 		ms.chanMap[requestID] = metaMessage.receiver
 		ms.chanMapMutex.Unlock()
 		if err := ms.prep(metaMessage.ctx); err != nil {
-			ReturnResponseViaChan(metaMessage.receiver, nil, err)
-			// delete request ID and chan from the Map
-			ms.chanMapMutex.Lock()
-			delete(ms.chanMap, requestID)
-			ms.chanMapMutex.Unlock()
+			// Return error and remove request ID and chan from the Map
+			ms.ReturnResponseViaChan(requestID, metaMessage.receiver, nil, err)
+
 		} else if err := ms.writeMsg(metaMessage.message); err != nil {
 			_ = ms.s.Reset()
 			ms.s = nil
-			ReturnResponseViaChan(metaMessage.receiver, nil, err)
+			// Return error and remove request ID and chan from the Map
+			ms.ReturnResponseViaChan(requestID, metaMessage.receiver, nil, err)
 			// flag the peer as unresponsive since we observed a write error
 			ms.UpdateUnresponsiveMap()
 			logger.Debugw("lookup patch", "infinite writer", "error while writing request", "to", ms.p.String(), "error", err)
-			// delete request ID and chan from the Map
-			ms.chanMapMutex.Lock()
-			delete(ms.chanMap, requestID)
-			ms.chanMapMutex.Unlock()
 		}
 
 	} else { // the peer is still considered unresponsive
-		ReturnResponseViaChan(metaMessage.receiver, nil, err)
+		ms.ReturnResponseViaChan(requestID, metaMessage.receiver, nil, err)
 	}
 }
 
+// Read response from a buffer. Reconstruct request ID and lookup
+// the corresponding receive channel from the Map.
+// Restore ClusterRaw field and deliver the response via the corresponding receive channel
 func (ms *peerMessageSender) handleRequestRead() {
 	if l, _ := ms.r.NextMsgLen(); l > 0 { // check if the buffer is not empty
 		bytes, err := ms.r.ReadMsg()
@@ -648,12 +719,9 @@ func (ms *peerMessageSender) handleRequestRead() {
 		// Restore the ClusterRaw field to its original value
 		ms.RestoreRequestInfo(response)
 		// Retreive corresponding rcv channel from the chanMap
-		ms.chanMapMutex.Lock()
-		defer ms.chanMapMutex.Unlock()
-		if rcvChan, ok := ms.chanMap[requestID]; ok {
-			// return response via rcv channel
-			ReturnResponseViaChan(rcvChan, response, err)
-			delete(ms.chanMap, requestID)
+		if ok, rcvChan := ms.findReceiveChan(requestID); ok {
+			// return response via rcv channel and delete requestID entry
+			ms.ReturnResponseViaChan(requestID, rcvChan, response, err)
 		} else {
 			// release memory
 			response = nil
@@ -662,4 +730,11 @@ func (ms *peerMessageSender) handleRequestRead() {
 
 	}
 
+}
+
+func (ms *peerMessageSender) findReceiveChan(id string) (found bool, rcv chan MetaMessage) {
+	ms.chanMapMutex.Lock()
+	defer ms.chanMapMutex.Unlock()
+	rcv, found = ms.chanMap[id]
+	return
 }

@@ -87,8 +87,6 @@ func (m *messageSenderImpl) OnDisconnect(ctx context.Context, p peer.ID) {
 	if ms.running {
 		ms.infiniteRwClose()
 		ms.running = false
-		close(ms.chanmessage)
-		close(ms.chanrequest)
 
 	}
 
@@ -487,15 +485,19 @@ var writerPool = sync.Pool{
 }
 
 func WriteMsg(w io.Writer, mes *pb.Message) error {
-	bw := writerPool.Get().(*bufferedDelimitedWriter)
-	bw.Reset(w)
-	err := bw.WriteMsg(mes)
-	if err == nil {
-		err = bw.Flush()
+	if mes != nil { // add a check to avoid nil pointer
+		bw := writerPool.Get().(*bufferedDelimitedWriter)
+		bw.Reset(w)
+
+		err := bw.WriteMsg(mes)
+		if err == nil {
+			err = bw.Flush()
+		}
+		bw.Reset(nil)
+		writerPool.Put(bw)
+		return err
 	}
-	bw.Reset(nil)
-	writerPool.Put(bw)
-	return err
+	return fmt.Errorf("nil proto message")
 }
 
 func (w *bufferedDelimitedWriter) Flush() error {
@@ -565,10 +567,14 @@ func (ms *peerMessageSender) runInfiniteWriter(ctx context.Context) {
 		// handle messages received from SendMessage().
 		// messages don't need response
 		case message := <-ms.chanmessage:
-			ms.handleMessageWrite(message)
+			if message.message != nil {
+				ms.handleMessageWrite(message)
+			}
 		// handle requests received from SendRequest()
 		case request := <-ms.chanrequest:
-			ms.handleRequestWrite(request)
+			if request.message != nil {
+				ms.handleRequestWrite(request)
+			}
 			// close go routine when remote peer (ms.p) is stopped, based on signal received from OnDisconnect() function
 		case <-ms.infiniteRwCtx.Done():
 			logger.Debugw("lookup patch", "infinite writer", "stopped", "for", ms.p.String())

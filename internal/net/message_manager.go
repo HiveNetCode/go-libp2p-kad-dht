@@ -32,6 +32,8 @@ var dhtReadMessageTimeout = 5 * time.Second        //@Hive: Setting the timeout 
 var dhtMessageSenderTimeout = 1 * time.Second      //@Hive: Adding timeout when creating Sender
 var dhtDefaultBackoffTime = 60 * time.Second       //@Hive: 1mn Backoff time for unresponsive peers
 var SmallReadWriteInterval = 10 * time.Millisecond // 100 writes per second
+var MaxWriteError = 3                              // Maximum write error before tagging a peer as unresponsive
+const streamReuseTries = 3
 
 // ErrReadTimeout is an error that occurs when no message is read within the timeout period.
 var ErrReadTimeout = fmt.Errorf("timed out reading response")
@@ -179,9 +181,9 @@ func (m *messageSenderImpl) SendMessage(ctx context.Context, p peer.ID, pmes *pb
 
 func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID) (*peerMessageSender, error) {
 	m.smlk.Lock()
+	defer m.smlk.Unlock()
 	ms, ok := m.strmap[p]
 	if ok { // return message sender only if the writer/Reader are running
-		m.smlk.Unlock()
 		return ms, nil
 	}
 	infContext := context.Background()
@@ -191,12 +193,8 @@ func (m *messageSenderImpl) messageSenderForPeer(ctx context.Context, p peer.ID)
 		chanrequest: make(chan MessageInfo), chanmessage: make(chan MessageInfo), running: false,
 		infiniteRwCtx: ReaderWriterContext, infiniteRwClose: ReaderWriterCancel}
 	m.strmap[p] = ms
-	m.smlk.Unlock()
 
 	if err := ms.prepOrInvalidate(ctx); err != nil {
-		m.smlk.Lock()
-		defer m.smlk.Unlock()
-
 		if msCur, ok := m.strmap[p]; ok {
 			// Changed. Use the new one, old one is invalid and
 			// not in the map so we can just throw it away.
@@ -244,6 +242,8 @@ type peerMessageSender struct {
 	running         bool
 	infiniteRwCtx   context.Context
 	infiniteRwClose context.CancelFunc
+	retryCount      int // count the number of non-time-out error (e.g., write error, etc.)
+	singleMes       int
 }
 
 // invalidate is called before this peerMessageSender is removed from the strmap.
@@ -344,10 +344,14 @@ func (ms *peerMessageSender) SendMessage(ctx context.Context, pmes *pb.Message) 
 		t := time.NewTimer(dhtReadMessageTimeout)
 		defer t.Stop()
 		select {
-		case ret := <-rcv:
+		case ret := <-rcv: // non time out error
 			if ret.err != nil {
 				ms.writeMutex.Lock()
-				ms.UpdateUnresponsiveMap()
+				ms.retryCount += 1                  // increment the write error count
+				if ms.retryCount >= MaxWriteError { // if Max write error is reached
+					ms.UpdateUnresponsiveMap()
+					ms.retryCount = 0
+				}
 				ms.writeMutex.Unlock()
 			}
 			return ret.err
@@ -442,9 +446,13 @@ func (ms *peerMessageSender) SendRequest(ctx context.Context, pmes *pb.Message) 
 		defer t.Stop()
 		select {
 		case ret := <-rcv:
-			if ret.err != nil {
+			if ret.err != nil { // non time out error
 				ms.writeMutex.Lock()
-				ms.UpdateUnresponsiveMap()
+				ms.retryCount += 1
+				if ms.retryCount >= MaxWriteError { // allow 3 retries
+					ms.UpdateUnresponsiveMap()
+					ms.retryCount = 0
+				}
 				ms.writeMutex.Unlock()
 			}
 			return ret.message, ret.err
@@ -651,19 +659,38 @@ func (ms *peerMessageSender) handleMessageWrite(metaMessage MessageInfo) {
 	defer ms.writeMutex.Unlock()
 	// Check if the peer was recently flagged as unresponsive
 	if err, unresponsive := ms.IsUnresponsivePeer(); !unresponsive {
-		if err := ms.prep(metaMessage.ctx); err != nil {
+		retry := false
+		for {
+			if err := ms.prep(metaMessage.ctx); err != nil {
+				ms.ReturnMsgResponseViaChan(metaMessage.receiver, nil, err)
+				break
+			} else if err := ms.writeMsg(metaMessage.message); err != nil {
+				_ = ms.s.Reset()
+				ms.s = nil
 
-			ms.ReturnMsgResponseViaChan(metaMessage.receiver, nil, err)
-		} else if err := ms.writeMsg(metaMessage.message); err != nil {
-			_ = ms.s.Reset()
+				// retry and stream reuse
+				if retry {
+					logger.Debugw("error writing request", "error", err)
+					ms.ReturnMsgResponseViaChan(metaMessage.receiver, nil, err)
+					// flag the peer as unresponsive since we observed a write error
+					ms.UpdateUnresponsiveMap()
+					logger.Debugw("lookup patch", "infinite writer", "error while writing message", "to", ms.p.String(), "error", err)
+					break
+				}
+				logger.Debugw("error writing request", "error", err, "retrying", true)
+				retry = true
+				continue
+			} else {
+				// no error
+				ms.ReturnMsgResponseViaChan(metaMessage.receiver, nil, nil)
+				break
+			}
+		}
+		if ms.singleMes > streamReuseTries {
+			_ = ms.s.Close()
 			ms.s = nil
-			ms.ReturnMsgResponseViaChan(metaMessage.receiver, nil, err)
-			// flag the peer as unresponsive
-			ms.UpdateUnresponsiveMap()
-			logger.Debugw("lookup patch", "infinite writer", "error while writing message", "to", ms.p.String(), "error", err)
-		} else {
-			// no error
-			ms.ReturnMsgResponseViaChan(metaMessage.receiver, nil, nil)
+		} else if retry {
+			ms.singleMes++
 		}
 
 	} else { // the peer is still considered unresponsive
@@ -684,18 +711,39 @@ func (ms *peerMessageSender) handleRequestWrite(metaMessage MessageInfo) {
 		ms.chanMapMutex.Lock()
 		ms.chanMap[requestID] = metaMessage.receiver
 		ms.chanMapMutex.Unlock()
-		if err := ms.prep(metaMessage.ctx); err != nil {
-			// Return error and remove request ID and chan from the Map
-			ms.ReturnResponseViaChan(requestID, metaMessage.receiver, nil, err)
+		retry := false
+		for {
+			// Allow retry and stream reuse
+			if err := ms.prep(metaMessage.ctx); err != nil {
+				// Return error and remove request ID and chan from the Map
+				ms.ReturnResponseViaChan(requestID, metaMessage.receiver, nil, err)
+				break
 
-		} else if err := ms.writeMsg(metaMessage.message); err != nil {
-			_ = ms.s.Reset()
+			} else if err := ms.writeMsg(metaMessage.message); err != nil {
+				// allow stream reuse
+				_ = ms.s.Reset()
+				ms.s = nil
+				// retry and stream reuse
+				if retry {
+					logger.Debugw("error writing request", "error", err)
+					// Return error and remove request ID and chan from the Map
+					ms.ReturnResponseViaChan(requestID, metaMessage.receiver, nil, err)
+					// flag the peer as unresponsive since we observed a write error
+					ms.UpdateUnresponsiveMap()
+					logger.Debugw("lookup patch", "infinite writer", "error while writing request", "to", ms.p.String(), "error", err)
+					break
+				}
+				logger.Debugw("error writing request", "error", err, "retrying", true)
+				retry = true
+				continue
+
+			}
+		}
+		if ms.singleMes > streamReuseTries {
+			_ = ms.s.Close()
 			ms.s = nil
-			// Return error and remove request ID and chan from the Map
-			ms.ReturnResponseViaChan(requestID, metaMessage.receiver, nil, err)
-			// flag the peer as unresponsive since we observed a write error
-			ms.UpdateUnresponsiveMap()
-			logger.Debugw("lookup patch", "infinite writer", "error while writing request", "to", ms.p.String(), "error", err)
+		} else if retry {
+			ms.singleMes++
 		}
 
 	} else { // the peer is still considered unresponsive

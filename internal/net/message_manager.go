@@ -737,6 +737,9 @@ func (ms *peerMessageSender) handleRequestWrite(metaMessage MessageInfo) {
 				retry = true
 				continue
 
+			} else {
+				// no error
+				break
 			}
 		}
 		if ms.singleMes > streamReuseTries {

@@ -687,8 +687,12 @@ func (ms *peerMessageSender) handleMessageWrite(metaMessage MessageInfo) {
 			}
 		}
 		if ms.singleMes > streamReuseTries {
-			_ = ms.s.Close()
-			ms.s = nil
+			// don't close nil stream,
+			// a new stream will be created in the next iteration by ms.prep()
+			if ms.s != nil {
+				_ = ms.s.Close()
+				ms.s = nil
+			}
 		} else if retry {
 			ms.singleMes++
 		}
@@ -743,8 +747,12 @@ func (ms *peerMessageSender) handleRequestWrite(metaMessage MessageInfo) {
 			}
 		}
 		if ms.singleMes > streamReuseTries {
-			_ = ms.s.Close()
-			ms.s = nil
+			// don't close nil stream,
+			// a new stream will be created in the next iteration by ms.prep()
+			if ms.s != nil {
+				_ = ms.s.Close()
+				ms.s = nil
+			}
 		} else if retry {
 			ms.singleMes++
 		}

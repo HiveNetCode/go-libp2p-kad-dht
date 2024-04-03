@@ -322,7 +322,7 @@ func (ms *peerMessageSender) SendMessage(ctx context.Context, pmes *pb.Message) 
 	}()
 	if isInfReaderWriterRunning {
 		rcv := make(chan MetaMessage)
-		defer close(rcv)
+		//defer close(rcv)
 		messageWithInfo := MessageInfo{
 			message:  pmes,
 			err:      nil,
@@ -334,8 +334,10 @@ func (ms *peerMessageSender) SendMessage(ctx context.Context, pmes *pb.Message) 
 		defer stopsend.Stop()
 		select {
 		case <-ms.infiniteRwCtx.Done():
+			close(rcv)
 			return fmt.Errorf("infinite message channel has been closed")
 		case <-stopsend.C:
+			close(rcv)
 			return fmt.Errorf("timed out while writing on message channel")
 		case ms.chanmessage <- messageWithInfo:
 		}
@@ -621,6 +623,7 @@ func (ms *peerMessageSender) runInfiniteReader(ctx context.Context) {
 // and delete request ID entry from the Map
 func (ms *peerMessageSender) ReturnResponseViaChan(requestID string, rcv chan MetaMessage, data *pb.Message, errc error) {
 	defer func() {
+		close(rcv) // close channel only on receiver side
 		ms.chanMapMutex.Lock()
 		defer ms.chanMapMutex.Unlock()
 		delete(ms.chanMap, requestID)
@@ -644,6 +647,7 @@ func (ms *peerMessageSender) ReturnMsgResponseViaChan(rcv chan MetaMessage, data
 	// because rcv is not used concurrently, so the write should be instantaneous
 	stopTimer := time.NewTimer(2 * time.Second)
 	defer stopTimer.Stop()
+	defer close(rcv) // closing the channel only on sender side
 	select {
 	case <-stopTimer.C:
 		return

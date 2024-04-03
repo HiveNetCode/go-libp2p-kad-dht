@@ -692,6 +692,8 @@ func (ms *peerMessageSender) handleMessageWrite(metaMessage MessageInfo) {
 			if ms.s != nil {
 				_ = ms.s.Close()
 				ms.s = nil
+			} else {
+				logger.Debugw("lookup patch", "infinite writer", "ignoring nil stream", "to", ms.p.String())
 			}
 		} else if retry {
 			ms.singleMes++
@@ -752,6 +754,8 @@ func (ms *peerMessageSender) handleRequestWrite(metaMessage MessageInfo) {
 			if ms.s != nil {
 				_ = ms.s.Close()
 				ms.s = nil
+			} else {
+				logger.Debugw("lookup patch", "infinite writer", "ignoring nil stream", "to", ms.p.String())
 			}
 		} else if retry {
 			ms.singleMes++

@@ -690,8 +690,13 @@ func (ms *peerMessageSender) handleMessageWrite(metaMessage MessageInfo) {
 			// don't close nil stream,
 			// a new stream will be created in the next iteration by ms.prep()
 			if ms.s != nil {
-				_ = ms.s.Close()
+				err = ms.s.Close()
+				if err != nil {
+					logger.Debugw("lookup patch", "infinite writer", "error when closing stream", "to", ms.p.String(), "error", err)
+				}
 				ms.s = nil
+			} else {
+				logger.Debugw("lookup patch", "infinite writer", "ignoring nil stream", "to", ms.p.String())
 			}
 		} else if retry {
 			ms.singleMes++
@@ -750,8 +755,13 @@ func (ms *peerMessageSender) handleRequestWrite(metaMessage MessageInfo) {
 			// don't close nil stream,
 			// a new stream will be created in the next iteration by ms.prep()
 			if ms.s != nil {
-				_ = ms.s.Close()
+				err = ms.s.Close()
+				if err != nil {
+					logger.Debugw("lookup patch", "infinite writer", "error when closing stream", "to", ms.p.String(), "error", err)
+				}
 				ms.s = nil
+			} else {
+				logger.Debugw("lookup patch", "infinite writer", "ignoring nil stream", "to", ms.p.String())
 			}
 		} else if retry {
 			ms.singleMes++

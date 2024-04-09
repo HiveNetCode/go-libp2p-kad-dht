@@ -790,7 +790,6 @@ func (ms *peerMessageSender) handleRequestRead() {
 		err = response.Unmarshal(bytes)
 		if err != nil {
 			ms.r.ReleaseMsg(bytes)
-			response = nil
 			return
 		}
 		// Retreive request ID from response
@@ -801,9 +800,6 @@ func (ms *peerMessageSender) handleRequestRead() {
 		if ok, rcvChan := ms.findReceiveChan(requestID); ok {
 			// return response via rcv channel and delete requestID entry
 			ms.ReturnResponseViaChan(requestID, rcvChan, response, err)
-		} else {
-			// release memory
-			response = nil
 		}
 		ms.r.ReleaseMsg(bytes)
 

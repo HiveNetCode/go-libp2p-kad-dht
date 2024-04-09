@@ -69,6 +69,13 @@ func (pm *ProtocolMessenger) PutValue(ctx context.Context, p peer.ID, rec *recpb
 		return err
 	}
 
+	// avoid check on nil record
+	// occurs only on super nodes in prod
+	if rpmes.GetRecord() == nil || pmes.GetRecord() == nil {
+		const errStr = "nil record in PUT"
+		logger.Warnw(errStr, "put-message", pmes, "get-message", rpmes)
+		return errors.New(errStr)
+	}
 	if !bytes.Equal(rpmes.GetRecord().Value, pmes.GetRecord().Value) {
 		const errStr = "value not put correctly"
 		logger.Infow(errStr, "put-message", pmes, "get-message", rpmes)
